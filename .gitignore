@@ -1,0 +1,8 @@
+# Arduino IDE
+build/
+*.elf
+*.bin
+*.map
+*.hex
+*.part
+.DS_Store
