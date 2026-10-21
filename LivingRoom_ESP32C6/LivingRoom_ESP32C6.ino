@@ -5,6 +5,11 @@
 #include <BH1750.h>
 #include <WiFiManager.h> 
 #include <Preferences.h> 
+#include <esp_task_wdt.h>   // Watchdog nativo ESP-IDF
+#include <esp_system.h>     // Causa del reset
+
+// --- Timeout Watchdog Hardware (secondi) ---
+#define WDT_TIMEOUT_SEC 8
 
 // --- Configurazione MQTT Dinamica ---
 char mqtt_server[40] = "";
@@ -30,46 +35,90 @@ PubSubClient mqttClient(espClient);
 Adafruit_SHT4x sht4x = Adafruit_SHT4x();
 BH1750 lightMeter;
 Preferences prefs;
-HardwareSerial RadarSerial(1); // UART1 hardware dedicata al radar
+HardwareSerial RadarSerial(1);
 
-// Flag di stato e validazione sensori I2C
-bool shouldSaveConfig = false;
-bool sht40_ok  = false;
-bool bh1750_ok = false;
+// Motivo del boot
+const char* bootReasonStr = "UNKNOWN";
 
-// --- Struttura Dati Radar LD2410C (UART) ---
-struct RadarData {
-  bool uart_valid          = false;
-  unsigned long lastFrame  = 0;
-  uint8_t targetState      = 0; // 0=Assente, 1=Movimento, 2=Statico, 3=Entrambi
-  uint16_t movingDistCm    = 0;
-  uint8_t movingEnergy     = 0;
-  uint16_t statDistCm      = 0;
-  uint8_t statEnergy       = 0;
-  uint16_t detectionDistCm = 0;
-} radar;
+// --- LAYER 1: STRUTTURA DATI INDIPENDENTE (Device State) ---
+struct DeviceData {
+  bool presence_raw         = false;
+  bool presence_filtered    = false;
+  uint8_t target_state      = 0;
+  uint16_t dist_cm          = 0;
+  uint16_t moving_dist_cm   = 0;
+  uint8_t moving_energy     = 0;
+  uint16_t stat_dist_cm     = 0;
+  uint8_t stat_energy       = 0;
+  bool radar_uart_ok        = false;
 
-// Buffer per il parser binario LD2410C
+  float temp_c              = 0.0;
+  float hum_pct             = 0.0;
+  bool sht40_ok             = false;
+  float lux                 = -1.0;
+  bool bh1750_ok            = false;
+
+  int32_t rssi              = 0;
+  uint32_t free_heap        = 0;
+  uint32_t min_free_heap    = 0;
+  uint32_t uptime_sec       = 0;
+} device;
+
+// Buffer parser UART radar
 uint8_t rxBuf[64];
 uint8_t rxIdx = 0;
+unsigned long lastRadarFrameTime = 0;
 
-// Timer Non-Bloccanti
-bool ultimaPresenza = false;
-unsigned long lastTelemetryTime     = 0;
-unsigned long lastMqttReconnectTime = 0;
-unsigned long buttonPressStartTime  = 0;
-bool isButtonPressed                = false;
+// Timer operativi e Non-Bloccanti
+bool shouldSaveConfig = false;
+bool ultimaPresenzaTrasmessa = false;
+unsigned long lastTelemetryTime      = 0;
+unsigned long lastMqttReconnectTime  = 0;
+unsigned long lastRadarDetectionTime = 0;
+unsigned long buttonPressStartTime   = 0;
+bool isButtonPressed                 = false;
 
-constexpr unsigned long TELEMETRY_INTERVAL      = 10000; // Pubblica telemetria ogni 10s
-constexpr unsigned long MQTT_RECONNECT_INTERVAL = 5000;  // Riprova MQTT ogni 5s
-constexpr unsigned long PORTAL_TRIGGER_TIME     = 3000;  // 3s sul tasto BOOT per portale
-constexpr unsigned long RADAR_TIMEOUT_MS        = 3000;  // Se 0 frame per 3s -> errore UART
+constexpr unsigned long TELEMETRY_INTERVAL      = 10000;
+constexpr unsigned long MQTT_RECONNECT_INTERVAL = 5000;
+constexpr unsigned long PORTAL_TRIGGER_TIME     = 3000;
+constexpr unsigned long RADAR_TIMEOUT_MS        = 3000;
+constexpr unsigned long PRESENCE_OFF_DELAY_MS   = 2500;
 
 void saveConfigCallback() {
   shouldSaveConfig = true;
 }
 
-// --- Parser Binario Nativo per Frame HLK-LD2410C ---
+// Decodifica motivo del reset hardware
+const char* ottieniMotivoReset() {
+  esp_reset_reason_t reason = esp_reset_reason();
+  switch (reason) {
+    case ESP_RST_POWERON:   return "POWER_ON";
+    case ESP_RST_EXT:       return "EXTERNAL_PIN";
+    case ESP_RST_SW:        return "SOFTWARE_RESTART";
+    case ESP_RST_PANIC:     return "EXCEPTION_PANIC";
+    case ESP_RST_INT_WDT:   return "INTERNAL_WDT";
+    case ESP_RST_TASK_WDT:  return "TASK_WDT_TRIGGERED";
+    case ESP_RST_WDT:       return "OTHER_WDT";
+    case ESP_RST_DEEPSLEEP: return "DEEP_SLEEP_WAKE";
+    case ESP_RST_BROWNOUT:  return "BROWNOUT_VOLTAGE_DROP";
+    case ESP_RST_SDIO:      return "SDIO_RESET";
+    case ESP_RST_USB:       return "USB_JTAG_RESET";
+    default:                return "OTHER_UNKNOWN";
+  }
+}
+
+// Decodifica stato target radar
+const char* decodificaStatoRadar(uint8_t state) {
+  switch (state) {
+    case 0:  return "none";
+    case 1:  return "moving";
+    case 2:  return "stationary";
+    case 3:  return "both";
+    default: return "unknown";
+  }
+}
+
+// --- LAYER 2: SENSOR DRIVERS ---
 void aggiornaRadarUART() {
   while (RadarSerial.available()) {
     uint8_t b = RadarSerial.read();
@@ -77,7 +126,7 @@ void aggiornaRadarUART() {
     if (rxIdx < sizeof(rxBuf)) {
       rxBuf[rxIdx++] = b;
     } else {
-      rxIdx = 0; 
+      rxIdx = 0;
     }
 
     if (rxIdx == 1 && rxBuf[0] != 0xF4) rxIdx = 0;
@@ -87,7 +136,7 @@ void aggiornaRadarUART() {
 
     if (rxIdx >= 6) {
       uint16_t dataLen = rxBuf[4] | (rxBuf[5] << 8);
-      uint16_t totalFrameLen = 4 + 2 + dataLen + 4; 
+      uint16_t totalFrameLen = 4 + 2 + dataLen + 4;
 
       if (totalFrameLen > sizeof(rxBuf) || dataLen < 11) {
         rxIdx = 0;
@@ -101,38 +150,51 @@ void aggiornaRadarUART() {
             rxBuf[totalFrameLen - 1] == 0xF5) {
           
           if ((rxBuf[6] == 0x02 || rxBuf[6] == 0x01) && rxBuf[7] == 0xAA) {
-            radar.targetState     = rxBuf[8] & 0x03;
-            radar.movingDistCm    = rxBuf[9]  | (rxBuf[10] << 8);
-            radar.movingEnergy    = rxBuf[11];
-            radar.statDistCm      = rxBuf[12] | (rxBuf[13] << 8);
-            radar.statEnergy      = rxBuf[14];
-            radar.detectionDistCm = rxBuf[15] | (rxBuf[16] << 8);
-            radar.lastFrame       = millis();
-            radar.uart_valid      = true;
+            device.target_state    = rxBuf[8] & 0x03;
+            device.moving_dist_cm  = rxBuf[9]  | (rxBuf[10] << 8);
+            device.moving_energy   = rxBuf[11];
+            device.stat_dist_cm    = rxBuf[12] | (rxBuf[13] << 8);
+            device.stat_energy     = rxBuf[14];
+            device.dist_cm         = rxBuf[15] | (rxBuf[16] << 8);
+            lastRadarFrameTime     = millis();
+            device.radar_uart_ok   = true;
           }
         }
-        rxIdx = 0; 
+        rxIdx = 0;
       }
     }
   }
 
-  if (radar.uart_valid && (millis() - radar.lastFrame > RADAR_TIMEOUT_MS)) {
-    radar.uart_valid = false;
-    Serial.println("[RADAR ERRORE] Timeout comunicazione UART con LD2410C!");
+  if (device.radar_uart_ok && (millis() - lastRadarFrameTime > RADAR_TIMEOUT_MS)) {
+    device.radar_uart_ok = false;
   }
 }
 
-const char* decodificaStatoRadar(uint8_t state) {
-  switch (state) {
-    case 0:  return "none";
-    case 1:  return "moving";
-    case 2:  return "stationary";
-    case 3:  return "both";
-    default: return "unknown";
+void leggiSensoriI2C() {
+  device.sht40_ok = false;
+  sensors_event_t hum, temp;
+  if (sht4x.getEvent(&hum, &temp)) {
+    if (!isnan(temp.temperature) && temp.temperature > -40.0 && temp.temperature < 85.0 &&
+        !isnan(hum.relative_humidity) && hum.relative_humidity >= 0.0 && hum.relative_humidity <= 100.0) {
+      device.temp_c = temp.temperature;
+      device.hum_pct = hum.relative_humidity;
+      device.sht40_ok = true;
+    }
+  } else {
+    sht4x.begin(&Wire);
+  }
+
+  float l = lightMeter.readLightLevel();
+  if (l >= 0.0 && l <= 65535.0) {
+    device.lux = l;
+    device.bh1750_ok = true;
+  } else {
+    device.bh1750_ok = false;
+    lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE, 0x23, &Wire);
   }
 }
 
-// --- Funzione Captive Portal ---
+// --- LAYER 3: CONFIGURAZIONE & PORTALE ---
 void avviaCaptivePortal(bool forzaApertura) {
   WiFiManager wifiManager;
   wifiManager.setSaveConfigCallback(saveConfigCallback);
@@ -156,17 +218,10 @@ void avviaCaptivePortal(bool forzaApertura) {
   wifiManager.setDarkMode(true);
   wifiManager.setConfigPortalTimeout(180);
 
-  bool connesso = false;
-  if (forzaApertura) {
-    Serial.println("[CONFIG] Apertura manuale del Captive Portal (Rete: SmartSense-Setup)...");
-    connesso = wifiManager.startConfigPortal("SmartSense-Setup");
-  } else {
-    Serial.println("[Wi-Fi] Connessione automatica o avvio Access Point...");
-    connesso = wifiManager.autoConnect("SmartSense-Setup");
-  }
+  bool connesso = forzaApertura ? wifiManager.startConfigPortal("SmartSense-Setup") 
+                                : wifiManager.autoConnect("SmartSense-Setup");
 
   if (!connesso) {
-    Serial.println("[ERRORE] Timeout portale. Riavvio scheda...");
     delay(2000);
     ESP.restart();
   }
@@ -180,31 +235,25 @@ void avviaCaptivePortal(bool forzaApertura) {
 
     if (new_server.length() > 0 && port_num > 0 && port_num <= 65535) {
       strlcpy(mqtt_server, new_server.c_str(), sizeof(mqtt_server));
-      strlcpy(mqtt_port, new_port.c_str(), sizeof(mqtt_port));
-      strlcpy(mqtt_user, custom_mqtt_user.getValue(), sizeof(mqtt_user));
-      strlcpy(mqtt_pass, custom_mqtt_pass.getValue(), sizeof(mqtt_pass));
+      strlcpy(mqtt_port,   new_port.c_str(),   sizeof(mqtt_port));
+      strlcpy(mqtt_user,   custom_mqtt_user.getValue(), sizeof(mqtt_user));
+      strlcpy(mqtt_pass,   custom_mqtt_pass.getValue(), sizeof(mqtt_pass));
 
       prefs.begin("smartsense", false);
       prefs.putString("server", mqtt_server);
-      prefs.putString("port", mqtt_port);
-      prefs.putString("user", mqtt_user);
-      prefs.putString("pass", mqtt_pass);
+      prefs.putString("port",   mqtt_port);
+      prefs.putString("user",   mqtt_user);
+      prefs.putString("pass",   mqtt_pass);
       prefs.end();
-      Serial.println("[CONFIG] Nuovi parametri MQTT validati e salvati!");
-    } else {
-      Serial.println("[ERRORE CONFIG] Parametri non validi! Salvataggio ignorato.");
+      Serial.println("[CONFIG] Parametri salvati in memoria!");
     }
     shouldSaveConfig = false;
   }
 }
 
-// --- Riconnessione MQTT Non-Bloccante ---
+// --- LAYER 4: TRANSPORT MQTT ---
 void tentativoConnessioneMqtt() {
   if (strlen(mqtt_server) == 0) return;
-
-  Serial.print("[MQTT] Tentativo connessione a ");
-  Serial.print(mqtt_server);
-  Serial.print(" ... ");
 
   String clientId = "SmartSense-Living-";
   clientId += String((uint32_t)ESP.getEfuseMac(), HEX);
@@ -217,45 +266,89 @@ void tentativoConnessioneMqtt() {
   }
 
   if (connected) {
-    Serial.println("CONNESSO!");
+    Serial.println("[MQTT] Connesso con successo!");
     mqttClient.publish(mqtt_topic_status, "online", true);
-  } else {
-    Serial.print("FALLITO (rc=");
-    Serial.print(mqttClient.state());
-    Serial.println("). Riprovo tra 5s.");
   }
 }
 
+void pubblicaDatiMQTT() {
+  char tempStr[10], humStr[10], luxStr[10];
+  char distStr[10], movDistStr[10], statDistStr[10], movEnStr[6], statEnStr[6];
+
+  if (device.sht40_ok) {
+    snprintf(tempStr, sizeof(tempStr), "%.2f", device.temp_c);
+    snprintf(humStr,  sizeof(humStr),  "%.2f", device.hum_pct);
+  } else {
+    strcpy(tempStr, "null");
+    strcpy(humStr, "null");
+  }
+
+  if (device.bh1750_ok) {
+    snprintf(luxStr, sizeof(luxStr), "%.2f", device.lux);
+  } else {
+    strcpy(luxStr, "null");
+  }
+
+  if (device.radar_uart_ok) {
+    snprintf(distStr,     sizeof(distStr),     "%u", device.dist_cm);
+    snprintf(movDistStr,  sizeof(movDistStr),  "%u", device.moving_dist_cm);
+    snprintf(statDistStr, sizeof(statDistStr), "%u", device.stat_dist_cm);
+    snprintf(movEnStr,    sizeof(movEnStr),    "%u", device.moving_energy);
+    snprintf(statEnStr,   sizeof(statEnStr),   "%u", device.stat_energy);
+  } else {
+    strcpy(distStr,     "null");
+    strcpy(movDistStr,  "null");
+    strcpy(statDistStr, "null");
+    strcpy(movEnStr,    "null");
+    strcpy(statEnStr,   "null");
+  }
+
+  char payload[512];
+  snprintf(payload, sizeof(payload), 
+           "{\"presence\":%s,\"radar_state\":\"%s\",\"distance_cm\":%s,"
+           "\"moving_dist_cm\":%s,\"moving_energy\":%s,\"stat_dist_cm\":%s,\"stat_energy\":%s,"
+           "\"temperature\":%s,\"humidity\":%s,\"lux\":%s,\"rssi\":%ld,"
+           "\"diag\":{\"heap_free\":%u,\"heap_min\":%u,\"uptime_s\":%lu,\"boot\":\"%s\"},"
+           "\"sensors\":{\"sht40\":\"%s\",\"bh1750\":\"%s\",\"ld2410c\":\"%s\"}}",
+           device.presence_filtered ? "true" : "false",
+           device.radar_uart_ok ? decodificaStatoRadar(device.target_state) : "fallback_gpio",
+           distStr, movDistStr, movEnStr, statDistStr, statEnStr,
+           tempStr, humStr, luxStr, (long)device.rssi,
+           device.free_heap, device.min_free_heap, (unsigned long)device.uptime_sec, bootReasonStr,
+           device.sht40_ok ? "ok" : "error",
+           device.bh1750_ok ? "ok" : "error",
+           device.radar_uart_ok ? "ok" : "error");
+
+  if (mqttClient.connected()) {
+    mqttClient.publish(mqtt_topic_env, payload);
+    Serial.print("[MQTT PUB] ");
+    Serial.println(payload);
+  }
+}
+
+// --- SETUP ---
 void setup() {
   Serial.begin(115200);
-  while (!Serial && millis() < 4000) { delay(10); }
+  while (!Serial && millis() < 3000) { delay(10); }
+
+  bootReasonStr = ottieniMotivoReset();
 
   Serial.println("\n=======================================================");
-  Serial.println("   SmartSense Lab - Nodo Salotto | Firmware v0.3");
+  Serial.println("   SmartSense Lab - Nodo Salotto | Firmware v0.5");
+  Serial.printf("   Motivo Avvio: %s\n", bootReasonStr);
   Serial.println("=======================================================");
 
   pinMode(RADAR_OUT_PIN, INPUT);
   pinMode(BUTTON_BOOT_PIN, INPUT_PULLUP);
 
-  // 1. Inizializzazione UART1 per HLK-LD2410C (256000 baud, 8N1, RX=GPIO17, TX=GPIO16)
   RadarSerial.begin(256000, SERIAL_8N1, RADAR_RX_PIN, RADAR_TX_PIN);
-  Serial.println("[RADAR] UART1 inizializzata a 256000 baud (RX=D7/GPIO17, TX=D6/GPIO16)");
 
-  // 2. Inizializzazione Sensori I2C
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
-  sht40_ok = sht4x.begin(&Wire);
-  if (sht40_ok) {
-    sht4x.setPrecision(SHT4X_HIGH_PRECISION);
-    sht4x.setHeater(SHT4X_NO_HEATER);
-    Serial.println("[SENSORI] SHT40: OK");
-  } else {
-    Serial.println("[SENSORI] SHT40: ERRORE");
-  }
+  sht4x.begin(&Wire);
+  sht4x.setPrecision(SHT4X_HIGH_PRECISION);
+  sht4x.setHeater(SHT4X_NO_HEATER);
+  lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE, 0x23, &Wire);
 
-  bh1750_ok = lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE, 0x23, &Wire);
-  Serial.println(bh1750_ok ? "[SENSORI] BH1750: OK" : "[SENSORI] BH1750: ERRORE");
-
-  // 3. Caricamento configurazione da NVS
   prefs.begin("smartsense", true);
   strlcpy(mqtt_server, prefs.getString("server", "").c_str(), sizeof(mqtt_server));
   strlcpy(mqtt_port,   prefs.getString("port", "1883").c_str(), sizeof(mqtt_port));
@@ -263,29 +356,41 @@ void setup() {
   strlcpy(mqtt_pass,   prefs.getString("pass", "").c_str(), sizeof(mqtt_pass));
   prefs.end();
 
-  bool mancaConfigurazioneMqtt = (strlen(mqtt_server) == 0);
-  avviaCaptivePortal(mancaConfigurazioneMqtt);
-
-  Serial.print("[Wi-Fi] Operativo! IP: ");
-  Serial.println(WiFi.localIP());
+  bool mancaMqtt = (strlen(mqtt_server) == 0);
+  avviaCaptivePortal(mancaMqtt);
 
   mqttClient.setServer(mqtt_server, atoi(mqtt_port));
-  mqttClient.setBufferSize(512);
-}
+  mqttClient.setBufferSize(576);
 
+  // --- CONFIGURAZIONE WATCHDOG TIMER (WDT) ---
+  esp_task_wdt_config_t wdt_config = {
+    .timeout_ms = WDT_TIMEOUT_SEC * 1000,
+    .idle_core_mask = (1 << 0),
+    .trigger_panic = true
+  };
+  
+  esp_err_t err = esp_task_wdt_init(&wdt_config);
+  if (err == ESP_ERR_INVALID_STATE) {
+    esp_task_wdt_reconfigure(&wdt_config);
+  }
+  esp_task_wdt_add(NULL);
+  Serial.printf("[WDT] Task Watchdog attivo (%d secondi timeout)\n", WDT_TIMEOUT_SEC);
+} // <--- parentesi di chiusura setup()
+
+// --- LOOP PRINCIPALE ---
 void loop() {
+  esp_task_wdt_reset();
+
   unsigned long now = millis();
 
-  // --- A. Lettura Continua Stream UART Radar ---
   aggiornaRadarUART();
 
-  // --- B. Gestione Pulsante Fisico BOOT (3s) ---
   if (digitalRead(BUTTON_BOOT_PIN) == LOW) {
     if (!isButtonPressed) {
       isButtonPressed = true;
       buttonPressStartTime = now;
     } else if (now - buttonPressStartTime >= PORTAL_TRIGGER_TIME) {
-      Serial.println("\n[INPUT] Pulsante BOOT premuto per 3s -> Riapertura configurazione!");
+      Serial.println("\n[PORTAL] Richiesta apertura portale da pulsante...");
       avviaCaptivePortal(true);
       mqttClient.setServer(mqtt_server, atoi(mqtt_port));
       mqttClient.disconnect();
@@ -295,7 +400,6 @@ void loop() {
     isButtonPressed = false;
   }
 
-  // --- C. Gestione Connettività Non-Bloccante ---
   if (WiFi.status() == WL_CONNECTED) {
     if (!mqttClient.connected()) {
       if (now - lastMqttReconnectTime >= MQTT_RECONNECT_INTERVAL) {
@@ -307,111 +411,33 @@ void loop() {
     }
   }
 
-  // --- D. Determinazione Presenza (UART Primaria + Pin OUT Fallback) ---
-  bool presenzaAttuale = false;
-  if (radar.uart_valid) {
-    presenzaAttuale = (radar.targetState > 0);
+  if (device.radar_uart_ok) {
+    device.presence_raw = (device.target_state > 0);
   } else {
-    presenzaAttuale = digitalRead(RADAR_OUT_PIN); 
+    device.presence_raw = digitalRead(RADAR_OUT_PIN);
   }
 
-  bool cambioPresenza = (presenzaAttuale != ultimaPresenza);
+  if (device.presence_raw) {
+    lastRadarDetectionTime = now;
+    device.presence_filtered = true;
+  } else {
+    if (now - lastRadarDetectionTime >= PRESENCE_OFF_DELAY_MS) {
+      device.presence_filtered = false;
+    }
+  }
 
-  if (cambioPresenza || (now - lastTelemetryTime >= TELEMETRY_INTERVAL)) {
+  bool cambioStatoPresenza = (device.presence_filtered != ultimaPresenzaTrasmessa);
+
+  if (cambioStatoPresenza || (now - lastTelemetryTime >= TELEMETRY_INTERVAL)) {
     lastTelemetryTime = now;
-    ultimaPresenza = presenzaAttuale;
+    ultimaPresenzaTrasmessa = device.presence_filtered;
 
-    if (cambioPresenza) {
-      Serial.printf("[EVENTO RADAR] Cambio presenza -> %s (Stato: %s, Distanza: %u cm)\n",
-                    presenzaAttuale ? "RILEVATA" : "ASSENTE",
-                    radar.uart_valid ? decodificaStatoRadar(radar.targetState) : "fallback_gpio",
-                    radar.detectionDistCm);
-    }
+    leggiSensoriI2C();
+    device.rssi          = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : 0;
+    device.free_heap     = esp_get_free_heap_size();
+    device.min_free_heap = esp_get_minimum_free_heap_size();
+    device.uptime_sec    = now / 1000;
 
-    // 1. Lettura SHT40
-    bool sht_read_valid = false;
-    float t = 0.0, h = 0.0;
-    if (!sht40_ok) sht40_ok = sht4x.begin(&Wire);
-    if (sht40_ok) {
-      sensors_event_t humidity, temp;
-      if (sht4x.getEvent(&humidity, &temp)) {
-        if (!isnan(temp.temperature) && temp.temperature > -40.0 && temp.temperature < 85.0 &&
-            !isnan(humidity.relative_humidity) && humidity.relative_humidity >= 0.0 && humidity.relative_humidity <= 100.0) {
-          t = temp.temperature;
-          h = humidity.relative_humidity;
-          sht_read_valid = true;
-        }
-      }
-    }
-
-    // 2. Lettura BH1750
-    bool bh_read_valid = false;
-    float lux = -1.0;
-    if (!bh1750_ok) bh1750_ok = lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE, 0x23, &Wire);
-    if (bh1750_ok) {
-      lux = lightMeter.readLightLevel();
-      if (lux >= 0.0 && lux <= 65535.0) bh_read_valid = true;
-    }
-
-    // 3. Formattazione stringhe JSON
-    char tempStr[12], humStr[12], luxStr[12];
-    char distStr[10], movDistStr[10], statDistStr[10], movEnStr[8], statEnStr[8];
-
-    if (sht_read_valid) {
-      snprintf(tempStr, sizeof(tempStr), "%.2f", t);
-      snprintf(humStr, sizeof(humStr), "%.2f", h);
-    } else {
-      strcpy(tempStr, "null");
-      strcpy(humStr, "null");
-    }
-
-    if (bh_read_valid) {
-      snprintf(luxStr, sizeof(luxStr), "%.2f", lux);
-    } else {
-      strcpy(luxStr, "null");
-    }
-
-    if (radar.uart_valid) {
-      snprintf(distStr,     sizeof(distStr),     "%u", radar.detectionDistCm);
-      snprintf(movDistStr,  sizeof(movDistStr),  "%u", radar.movingDistCm);
-      snprintf(statDistStr, sizeof(statDistStr), "%u", radar.statDistCm);
-      snprintf(movEnStr,    sizeof(movEnStr),    "%u", radar.movingEnergy);
-      snprintf(statEnStr,   sizeof(statEnStr),   "%u", radar.statEnergy);
-    } else {
-      strcpy(distStr,     "null");
-      strcpy(movDistStr,  "null");
-      strcpy(statDistStr, "null");
-      strcpy(movEnStr,    "null");
-      strcpy(statEnStr,   "null");
-    }
-
-    int32_t rssi = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : 0;
-
-    // 4. Costruzione Payload JSON v0.3
-    char payload[480];
-    snprintf(payload, sizeof(payload), 
-             "{\"presence\":%s,\"radar_state\":\"%s\",\"distance_cm\":%s,"
-             "\"moving_dist_cm\":%s,\"moving_energy\":%s,\"stat_dist_cm\":%s,\"stat_energy\":%s,"
-             "\"temperature\":%s,\"humidity\":%s,\"lux\":%s,\"rssi\":%ld,"
-             "\"sensors\":{\"sht40\":\"%s\",\"bh1750\":\"%s\",\"ld2410c\":\"%s\"}}",
-             presenzaAttuale ? "true" : "false",
-             radar.uart_valid ? decodificaStatoRadar(radar.targetState) : "fallback_gpio",
-             distStr, movDistStr, movEnStr, statDistStr, statEnStr,
-             tempStr, humStr, luxStr, (long)rssi,
-             sht_read_valid ? "ok" : "error",
-             bh_read_valid ? "ok" : "error",
-             radar.uart_valid ? "ok" : "error");
-
-    if (mqttClient.connected()) {
-      if (mqttClient.publish(mqtt_topic_env, payload)) {
-        Serial.print("[MQTT OK] ");
-        Serial.println(payload);
-      } else {
-        Serial.println("[MQTT ERRORE] Fallita la publish()!");
-      }
-    } else {
-      Serial.print("[LOCALE - NO MQTT] ");
-      Serial.println(payload);
-    }
+    pubblicaDatiMQTT();
   }
 }
