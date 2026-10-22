@@ -18,8 +18,10 @@ char mqtt_user[40]   = "";
 char mqtt_pass[40]   = "";
 
 // Topic MQTT
-const char* mqtt_topic_env    = "smartsense/livingroom/environment";
-const char* mqtt_topic_status = "smartsense/livingroom/status";
+const char* mqtt_topic_env         = "smartsense/livingroom/environment";
+const char* mqtt_topic_status      = "smartsense/livingroom/status";
+const char* mqtt_topic_set         = "smartsense/livingroom/set";
+const char* mqtt_topic_config_stat = "smartsense/livingroom/config/state";
 
 // --- Pin Hardware XIAO ESP32-C6 ---
 constexpr uint8_t I2C_SDA_PIN     = 22; // D4
@@ -39,6 +41,14 @@ HardwareSerial RadarSerial(1);
 
 // Motivo del boot
 const char* bootReasonStr = "UNKNOWN";
+
+// --- PARAMETRI DI CALIBRAZIONE (Salvati su NVS) ---
+struct CalibrationData {
+  float temp_offset      = 0.0;  // Compensazione riscaldamento scheda
+  float hum_offset       = 0.0;  // Offset umidità
+  float lux_factor       = 1.0;  // Moltiplicatore per eventuale cover/diffusore
+  uint32_t off_delay_ms  = 2500; // Isteresi spegnimento presenza radar
+} calib;
 
 // --- LAYER 1: STRUTTURA DATI INDIPENDENTE (Device State) ---
 struct DeviceData {
@@ -82,13 +92,11 @@ constexpr unsigned long TELEMETRY_INTERVAL      = 10000;
 constexpr unsigned long MQTT_RECONNECT_INTERVAL = 5000;
 constexpr unsigned long PORTAL_TRIGGER_TIME     = 3000;
 constexpr unsigned long RADAR_TIMEOUT_MS        = 3000;
-constexpr unsigned long PRESENCE_OFF_DELAY_MS   = 2500;
 
 void saveConfigCallback() {
   shouldSaveConfig = true;
 }
 
-// Decodifica motivo del reset hardware
 const char* ottieniMotivoReset() {
   esp_reset_reason_t reason = esp_reset_reason();
   switch (reason) {
@@ -107,7 +115,6 @@ const char* ottieniMotivoReset() {
   }
 }
 
-// Decodifica stato target radar
 const char* decodificaStatoRadar(uint8_t state) {
   switch (state) {
     case 0:  return "none";
@@ -115,6 +122,77 @@ const char* decodificaStatoRadar(uint8_t state) {
     case 2:  return "stationary";
     case 3:  return "both";
     default: return "unknown";
+  }
+}
+
+void pubblicaStatoCalibrazione() {
+  char calBuf[256];
+  snprintf(calBuf, sizeof(calBuf),
+           "{\"temp_offset\":%.2f,\"hum_offset\":%.2f,\"lux_factor\":%.2f,\"off_delay_ms\":%u}",
+           calib.temp_offset, calib.hum_offset, calib.lux_factor, calib.off_delay_ms);
+  mqttClient.publish(mqtt_topic_config_stat, calBuf, true);
+  Serial.print("[CONFIG PUB] ");
+  Serial.println(calBuf);
+}
+
+// Parser minimale e sicuro per i comandi JSON su "smartsense/livingroom/set"
+void processaComandoCalibrazione(const char* payload) {
+  bool updated = false;
+
+  // 1. temp_offset
+  const char* pTemp = strstr(payload, "\"temp_offset\":");
+  if (pTemp) {
+    calib.temp_offset = atof(pTemp + 14);
+    updated = true;
+  }
+
+  // 2. hum_offset
+  const char* pHum = strstr(payload, "\"hum_offset\":");
+  if (pHum) {
+    calib.hum_offset = atof(pHum + 13);
+    updated = true;
+  }
+
+  // 3. lux_factor
+  const char* pLux = strstr(payload, "\"lux_factor\":");
+  if (pLux) {
+    float f = atof(pLux + 13);
+    if (f > 0.05 && f < 20.0) { // Limiti di sicurezza
+      calib.lux_factor = f;
+      updated = true;
+    }
+  }
+
+  // 4. off_delay (in ms)
+  const char* pDelay = strstr(payload, "\"off_delay\":");
+  if (pDelay) {
+    uint32_t d = (uint32_t)atoi(pDelay + 12);
+    if (d >= 200 && d <= 60000) { // Tra 200ms e 60s
+      calib.off_delay_ms = d;
+      updated = true;
+    }
+  }
+
+  if (updated) {
+    prefs.begin("smartsense", false);
+    prefs.putFloat("t_off", calib.temp_offset);
+    prefs.putFloat("h_off", calib.hum_offset);
+    prefs.putFloat("l_fac", calib.lux_factor);
+    prefs.putUInt("r_del",  calib.off_delay_ms);
+    prefs.end();
+    Serial.println("[CALIB] Nuovi parametri salvati in NVS Flash!");
+    pubblicaStatoCalibrazione();
+  }
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  if (strcmp(topic, mqtt_topic_set) == 0) {
+    char msg[128];
+    if (length >= sizeof(msg)) length = sizeof(msg) - 1;
+    memcpy(msg, payload, length);
+    msg[length] = '\0';
+    Serial.printf("[MQTT RX set] %s\n", msg);
+    processaComandoCalibrazione(msg);
   }
 }
 
@@ -176,8 +254,15 @@ void leggiSensoriI2C() {
   if (sht4x.getEvent(&hum, &temp)) {
     if (!isnan(temp.temperature) && temp.temperature > -40.0 && temp.temperature < 85.0 &&
         !isnan(hum.relative_humidity) && hum.relative_humidity >= 0.0 && hum.relative_humidity <= 100.0) {
-      device.temp_c = temp.temperature;
-      device.hum_pct = hum.relative_humidity;
+      
+      // Applicazione offset di calibrazione canonici
+      device.temp_c = temp.temperature + calib.temp_offset;
+      
+      float comp_h = hum.relative_humidity + calib.hum_offset;
+      if (comp_h < 0.0) comp_h = 0.0;
+      if (comp_h > 100.0) comp_h = 100.0;
+      device.hum_pct = comp_h;
+      
       device.sht40_ok = true;
     }
   } else {
@@ -186,7 +271,8 @@ void leggiSensoriI2C() {
 
   float l = lightMeter.readLightLevel();
   if (l >= 0.0 && l <= 65535.0) {
-    device.lux = l;
+    // Applicazione moltiplicatore lux
+    device.lux = l * calib.lux_factor;
     device.bh1750_ok = true;
   } else {
     device.bh1750_ok = false;
@@ -268,6 +354,13 @@ void tentativoConnessioneMqtt() {
   if (connected) {
     Serial.println("[MQTT] Connesso con successo!");
     mqttClient.publish(mqtt_topic_status, "online", true);
+    
+    // Sottoscrizione al canale di calibrazione comandi
+    mqttClient.subscribe(mqtt_topic_set);
+    Serial.printf("[MQTT] Iscritto a %s\n", mqtt_topic_set);
+    
+    // Pubblicazione dello stato dei parametri correnti
+    pubblicaStatoCalibrazione();
   }
 }
 
@@ -334,7 +427,7 @@ void setup() {
   bootReasonStr = ottieniMotivoReset();
 
   Serial.println("\n=======================================================");
-  Serial.println("   SmartSense Lab - Nodo Salotto | Firmware v0.5");
+  Serial.println("   SmartSense Lab - Nodo Salotto | Firmware v0.4");
   Serial.printf("   Motivo Avvio: %s\n", bootReasonStr);
   Serial.println("=======================================================");
 
@@ -349,17 +442,24 @@ void setup() {
   sht4x.setHeater(SHT4X_NO_HEATER);
   lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE, 0x23, &Wire);
 
+  // Caricamento credenziali e parametri di calibrazione da Flash NVS
   prefs.begin("smartsense", true);
   strlcpy(mqtt_server, prefs.getString("server", "").c_str(), sizeof(mqtt_server));
   strlcpy(mqtt_port,   prefs.getString("port", "1883").c_str(), sizeof(mqtt_port));
   strlcpy(mqtt_user,   prefs.getString("user", "").c_str(), sizeof(mqtt_user));
   strlcpy(mqtt_pass,   prefs.getString("pass", "").c_str(), sizeof(mqtt_pass));
+
+  calib.temp_offset  = prefs.getFloat("t_off", 0.0);
+  calib.hum_offset   = prefs.getFloat("h_off", 0.0);
+  calib.lux_factor   = prefs.getFloat("l_fac", 1.0);
+  calib.off_delay_ms = prefs.getUInt("r_del", 2500);
   prefs.end();
 
   bool mancaMqtt = (strlen(mqtt_server) == 0);
   avviaCaptivePortal(mancaMqtt);
 
   mqttClient.setServer(mqtt_server, atoi(mqtt_port));
+  mqttClient.setCallback(mqttCallback);
   mqttClient.setBufferSize(576);
 
   // --- CONFIGURAZIONE WATCHDOG TIMER (WDT) ---
@@ -375,7 +475,7 @@ void setup() {
   }
   esp_task_wdt_add(NULL);
   Serial.printf("[WDT] Task Watchdog attivo (%d secondi timeout)\n", WDT_TIMEOUT_SEC);
-} // <--- parentesi di chiusura setup()
+}
 
 // --- LOOP PRINCIPALE ---
 void loop() {
@@ -421,7 +521,7 @@ void loop() {
     lastRadarDetectionTime = now;
     device.presence_filtered = true;
   } else {
-    if (now - lastRadarDetectionTime >= PRESENCE_OFF_DELAY_MS) {
+    if (now - lastRadarDetectionTime >= calib.off_delay_ms) {
       device.presence_filtered = false;
     }
   }
