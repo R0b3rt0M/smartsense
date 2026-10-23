@@ -1,543 +1,312 @@
-#include <WiFi.h>
-#include <PubSubClient.h>
+#include <Arduino.h>
 #include <Wire.h>
+#include <math.h>
+#include <Zigbee.h>
 #include "Adafruit_SHT4x.h"
 #include <BH1750.h>
-#include <WiFiManager.h> 
-#include <Preferences.h> 
-#include <esp_task_wdt.h>   // Watchdog nativo ESP-IDF
-#include <esp_system.h>     // Causa del reset
 
-// --- Timeout Watchdog Hardware (secondi) ---
-#define WDT_TIMEOUT_SEC 8
+// ============================================================
+// SmartSense Lab - Zigbee Multisensore v0.3.1
+// Hardware: Seeed XIAO ESP32-C6
+// Sensori: SHT40 + BH1750 + HLK-LD2410C
+// Ruolo Zigbee: Router (Alimentato a rete)
+// ============================================================
 
-// --- Configurazione MQTT Dinamica ---
-char mqtt_server[40] = "";
-char mqtt_port[6]    = "1883";
-char mqtt_user[40]   = "";
-char mqtt_pass[40]   = "";
-
-// Topic MQTT
-const char* mqtt_topic_env         = "smartsense/livingroom/environment";
-const char* mqtt_topic_status      = "smartsense/livingroom/status";
-const char* mqtt_topic_set         = "smartsense/livingroom/set";
-const char* mqtt_topic_config_stat = "smartsense/livingroom/config/state";
-
-// --- Pin Hardware XIAO ESP32-C6 ---
+// -------------------- Pin Hardware XIAO ESP32-C6 --------------------
 constexpr uint8_t I2C_SDA_PIN     = 22; // D4
 constexpr uint8_t I2C_SCL_PIN     = 23; // D5
-constexpr uint8_t RADAR_OUT_PIN   = 3;  // D1 (GPIO3 - Uscita digitale LD2410C per fallback)
-constexpr uint8_t RADAR_TX_PIN    = 16; // D6 (GPIO16 - XIAO TX -> LD2410C RX)
-constexpr uint8_t RADAR_RX_PIN    = 17; // D7 (GPIO17 - XIAO RX <- LD2410C TX)
-constexpr uint8_t BUTTON_BOOT_PIN = 9;  // Pulsante 'B' integrato sullo XIAO
+constexpr uint8_t RADAR_OUT_PIN   = 3;  // D1
+constexpr uint8_t BUTTON_BOOT_PIN = 9;  // Pulsante 'B' integrato (Attivo LOW)
 
-// Oggetti globali
-WiFiClient espClient;
-PubSubClient mqttClient(espClient);
-Adafruit_SHT4x sht4x = Adafruit_SHT4x();
+// -------------------- Endpoint Zigbee Canonici ----------------------
+constexpr uint8_t ZIGBEE_EP_OCCUPANCY   = 10;
+constexpr uint8_t ZIGBEE_EP_ENVIRONMENT = 11; // Temperatura (0x0402) + Umidità (0x0405)
+constexpr uint8_t ZIGBEE_EP_ILLUMINANCE  = 12; // Illuminamento (0x0400)
+
+// -------------------- Temporizzazioni e Debounce ---------------------
+constexpr unsigned long SENSOR_REPORT_INTERVAL_MS = 10000UL;
+constexpr unsigned long FACTORY_RESET_HOLD_MS     = 3000UL;
+constexpr unsigned long BUTTON_DEBOUNCE_MS        = 50UL;
+
+// -------------------- Istanze Oggetti Zigbee ------------------------
+ZigbeeOccupancySensor   zbOccupancy(ZIGBEE_EP_OCCUPANCY);
+ZigbeeTempSensor        zbEnvironment(ZIGBEE_EP_ENVIRONMENT);
+ZigbeeIlluminanceSensor zbIlluminance(ZIGBEE_EP_ILLUMINANCE);
+
+// -------------------- Sensori Fisici --------------------------------
+Adafruit_SHT4x sht4x;
 BH1750 lightMeter;
-Preferences prefs;
-HardwareSerial RadarSerial(1);
 
-// Motivo del boot
-const char* bootReasonStr = "UNKNOWN";
+bool sht40Ok  = false;
+bool bh1750Ok = false;
 
-// --- PARAMETRI DI CALIBRAZIONE (Salvati su NVS) ---
-struct CalibrationData {
-  float temp_offset      = 0.0;  // Compensazione riscaldamento scheda
-  float hum_offset       = 0.0;  // Offset umidità
-  float lux_factor       = 1.0;  // Moltiplicatore per eventuale cover/diffusore
-  uint32_t off_delay_ms  = 2500; // Isteresi spegnimento presenza radar
-} calib;
+// -------------------- Stato Runtime ---------------------------------
+bool occupancyState        = false;
+bool lastConnectedState    = false;
 
-// --- LAYER 1: STRUTTURA DATI INDIPENDENTE (Device State) ---
-struct DeviceData {
-  bool presence_raw         = false;
-  bool presence_filtered    = false;
-  uint8_t target_state      = 0;
-  uint16_t dist_cm          = 0;
-  uint16_t moving_dist_cm   = 0;
-  uint8_t moving_energy     = 0;
-  uint16_t stat_dist_cm     = 0;
-  uint8_t stat_energy       = 0;
-  bool radar_uart_ok        = false;
+unsigned long lastSensorReportTime = 0;
+unsigned long buttonPressTime      = 0;
+unsigned long buttonLastChangeTime = 0;
 
-  float temp_c              = 0.0;
-  float hum_pct             = 0.0;
-  bool sht40_ok             = false;
-  float lux                 = -1.0;
-  bool bh1750_ok            = false;
+bool buttonWasLow          = false;
+bool factoryResetTriggered = false;
 
-  int32_t rssi              = 0;
-  uint32_t free_heap        = 0;
-  uint32_t min_free_heap    = 0;
-  uint32_t uptime_sec       = 0;
-} device;
-
-// Buffer parser UART radar
-uint8_t rxBuf[64];
-uint8_t rxIdx = 0;
-unsigned long lastRadarFrameTime = 0;
-
-// Timer operativi e Non-Bloccanti
-bool shouldSaveConfig = false;
-bool ultimaPresenzaTrasmessa = false;
-unsigned long lastTelemetryTime      = 0;
-unsigned long lastMqttReconnectTime  = 0;
-unsigned long lastRadarDetectionTime = 0;
-unsigned long buttonPressStartTime   = 0;
-bool isButtonPressed                 = false;
-
-constexpr unsigned long TELEMETRY_INTERVAL      = 10000;
-constexpr unsigned long MQTT_RECONNECT_INTERVAL = 5000;
-constexpr unsigned long PORTAL_TRIGGER_TIME     = 3000;
-constexpr unsigned long RADAR_TIMEOUT_MS        = 3000;
-
-void saveConfigCallback() {
-  shouldSaveConfig = true;
+// ============================================================
+// Conversione ZCL: Lux -> MeasuredValue (Cluster 0x0400)
+// Formula ZCL: MeasuredValue = 10000 * log10(lux) + 1
+// ============================================================
+uint16_t luxToZclMeasuredValue(float lux) {
+  if (!isfinite(lux) || lux <= 0.0001f) {
+    return 0; // Standard ZCL: troppo buio / limite inferiore
+  }
+  if (lux > 100000.0f) {
+    lux = 100000.0f;
+  }
+  float zcl = 10000.0f * log10f(lux) + 1.0f;
+  if (zcl < 1.0f) zcl = 1.0f;
+  if (zcl > 0xFFFE) zcl = 0xFFFE;
+  return static_cast<uint16_t>(lroundf(zcl));
 }
 
-const char* ottieniMotivoReset() {
-  esp_reset_reason_t reason = esp_reset_reason();
-  switch (reason) {
-    case ESP_RST_POWERON:   return "POWER_ON";
-    case ESP_RST_EXT:       return "EXTERNAL_PIN";
-    case ESP_RST_SW:        return "SOFTWARE_RESTART";
-    case ESP_RST_PANIC:     return "EXCEPTION_PANIC";
-    case ESP_RST_INT_WDT:   return "INTERNAL_WDT";
-    case ESP_RST_TASK_WDT:  return "TASK_WDT_TRIGGERED";
-    case ESP_RST_WDT:       return "OTHER_WDT";
-    case ESP_RST_DEEPSLEEP: return "DEEP_SLEEP_WAKE";
-    case ESP_RST_BROWNOUT:  return "BROWNOUT_VOLTAGE_DROP";
-    case ESP_RST_SDIO:      return "SDIO_RESET";
-    case ESP_RST_USB:       return "USB_JTAG_RESET";
-    default:                return "OTHER_UNKNOWN";
-  }
-}
+// ============================================================
+// Lettura e Report Misure Ambientali
+// ============================================================
+void inviaMisureSensori() {
+  // 1. Temperatura e Umidità (SHT40)
+  if (sht40Ok) {
+    sensors_event_t humidityEvent;
+    sensors_event_t temperatureEvent;
 
-const char* decodificaStatoRadar(uint8_t state) {
-  switch (state) {
-    case 0:  return "none";
-    case 1:  return "moving";
-    case 2:  return "stationary";
-    case 3:  return "both";
-    default: return "unknown";
-  }
-}
+    if (sht4x.getEvent(&humidityEvent, &temperatureEvent)) {
+      const float temperature = temperatureEvent.temperature;
+      const float humidity    = humidityEvent.relative_humidity;
 
-void pubblicaStatoCalibrazione() {
-  char calBuf[256];
-  snprintf(calBuf, sizeof(calBuf),
-           "{\"temp_offset\":%.2f,\"hum_offset\":%.2f,\"lux_factor\":%.2f,\"off_delay_ms\":%u}",
-           calib.temp_offset, calib.hum_offset, calib.lux_factor, calib.off_delay_ms);
-  mqttClient.publish(mqtt_topic_config_stat, calBuf, true);
-  Serial.print("[CONFIG PUB] ");
-  Serial.println(calBuf);
-}
+      if (isfinite(temperature) && isfinite(humidity) &&
+          temperature >= -40.0f && temperature <= 125.0f &&
+          humidity >= 0.0f && humidity <= 100.0f) {
 
-// Parser minimale e sicuro per i comandi JSON su "smartsense/livingroom/set"
-void processaComandoCalibrazione(const char* payload) {
-  bool updated = false;
+        zbEnvironment.setTemperature(temperature);
+        zbEnvironment.setHumidity(humidity);
 
-  // 1. temp_offset
-  const char* pTemp = strstr(payload, "\"temp_offset\":");
-  if (pTemp) {
-    calib.temp_offset = atof(pTemp + 14);
-    updated = true;
-  }
-
-  // 2. hum_offset
-  const char* pHum = strstr(payload, "\"hum_offset\":");
-  if (pHum) {
-    calib.hum_offset = atof(pHum + 13);
-    updated = true;
-  }
-
-  // 3. lux_factor
-  const char* pLux = strstr(payload, "\"lux_factor\":");
-  if (pLux) {
-    float f = atof(pLux + 13);
-    if (f > 0.05 && f < 20.0) { // Limiti di sicurezza
-      calib.lux_factor = f;
-      updated = true;
-    }
-  }
-
-  // 4. off_delay (in ms)
-  const char* pDelay = strstr(payload, "\"off_delay\":");
-  if (pDelay) {
-    uint32_t d = (uint32_t)atoi(pDelay + 12);
-    if (d >= 200 && d <= 60000) { // Tra 200ms e 60s
-      calib.off_delay_ms = d;
-      updated = true;
-    }
-  }
-
-  if (updated) {
-    prefs.begin("smartsense", false);
-    prefs.putFloat("t_off", calib.temp_offset);
-    prefs.putFloat("h_off", calib.hum_offset);
-    prefs.putFloat("l_fac", calib.lux_factor);
-    prefs.putUInt("r_del",  calib.off_delay_ms);
-    prefs.end();
-    Serial.println("[CALIB] Nuovi parametri salvati in NVS Flash!");
-    pubblicaStatoCalibrazione();
-  }
-}
-
-void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  if (strcmp(topic, mqtt_topic_set) == 0) {
-    char msg[128];
-    if (length >= sizeof(msg)) length = sizeof(msg) - 1;
-    memcpy(msg, payload, length);
-    msg[length] = '\0';
-    Serial.printf("[MQTT RX set] %s\n", msg);
-    processaComandoCalibrazione(msg);
-  }
-}
-
-// --- LAYER 2: SENSOR DRIVERS ---
-void aggiornaRadarUART() {
-  while (RadarSerial.available()) {
-    uint8_t b = RadarSerial.read();
-
-    if (rxIdx < sizeof(rxBuf)) {
-      rxBuf[rxIdx++] = b;
-    } else {
-      rxIdx = 0;
-    }
-
-    if (rxIdx == 1 && rxBuf[0] != 0xF4) rxIdx = 0;
-    else if (rxIdx == 2 && rxBuf[1] != 0xF3) rxIdx = 0;
-    else if (rxIdx == 3 && rxBuf[2] != 0xF2) rxIdx = 0;
-    else if (rxIdx == 4 && rxBuf[3] != 0xF1) rxIdx = 0;
-
-    if (rxIdx >= 6) {
-      uint16_t dataLen = rxBuf[4] | (rxBuf[5] << 8);
-      uint16_t totalFrameLen = 4 + 2 + dataLen + 4;
-
-      if (totalFrameLen > sizeof(rxBuf) || dataLen < 11) {
-        rxIdx = 0;
-        continue;
-      }
-
-      if (rxIdx == totalFrameLen) {
-        if (rxBuf[totalFrameLen - 4] == 0xF8 &&
-            rxBuf[totalFrameLen - 3] == 0xF7 &&
-            rxBuf[totalFrameLen - 2] == 0xF6 &&
-            rxBuf[totalFrameLen - 1] == 0xF5) {
-          
-          if ((rxBuf[6] == 0x02 || rxBuf[6] == 0x01) && rxBuf[7] == 0xAA) {
-            device.target_state    = rxBuf[8] & 0x03;
-            device.moving_dist_cm  = rxBuf[9]  | (rxBuf[10] << 8);
-            device.moving_energy   = rxBuf[11];
-            device.stat_dist_cm    = rxBuf[12] | (rxBuf[13] << 8);
-            device.stat_energy     = rxBuf[14];
-            device.dist_cm         = rxBuf[15] | (rxBuf[16] << 8);
-            lastRadarFrameTime     = millis();
-            device.radar_uart_ok   = true;
-          }
+        if (zbEnvironment.report()) {
+          Serial.printf("[ZIGBEE] SHT40 -> Temp: %.2f °C | Umidita: %.2f %%\n", temperature, humidity);
+        } else {
+          Serial.println("[ZIGBEE] Errore report SHT40");
         }
-        rxIdx = 0;
+      } else {
+        Serial.println("[SHT40] Dati letti fuori range");
+      }
+    } else {
+      Serial.println("[SHT40] Errore lettura bus I2C");
+    }
+  }
+
+  // 2. Illuminamento (BH1750)
+  if (bh1750Ok) {
+    const float lux = lightMeter.readLightLevel();
+
+    if (isfinite(lux) && lux >= 0.0f && lux <= 65535.0f) {
+      const uint16_t zclValue = luxToZclMeasuredValue(lux);
+
+      zbIlluminance.setIlluminance(zclValue);
+
+      if (zbIlluminance.report()) {
+        Serial.printf("[ZIGBEE] BH1750 -> Luce: %.2f lx (ZCL Raw: %u)\n", lux, zclValue);
+      } else {
+        Serial.println("[ZIGBEE] Errore report BH1750");
+      }
+    } else {
+      Serial.printf("[BH1750] Lettura non valida: %.2f\n", lux);
+    }
+  }
+}
+
+// ============================================================
+// Aggiornamento Presenza (LD2410C pin OUT)
+// ============================================================
+void aggiornaPresenza(bool forzaReport = false) {
+  const bool nuovaPresenza = (digitalRead(RADAR_OUT_PIN) == HIGH);
+  const bool cambiata      = (nuovaPresenza != occupancyState);
+
+  if (cambiata) {
+    occupancyState = nuovaPresenza;
+    Serial.printf("[RADAR] Presenza: %s\n", occupancyState ? "RILEVATA" : "ASSENTE");
+  }
+
+  if (cambiata || forzaReport) {
+    zbOccupancy.setOccupancy(occupancyState);
+
+    if (Zigbee.connected()) {
+      if (zbOccupancy.report()) {
+        Serial.printf("[ZIGBEE] Report presenza trasmesso: %s\n", occupancyState ? "RILEVATA" : "ASSENTE");
+      } else {
+        Serial.println("[ZIGBEE] Errore report presenza");
       }
     }
   }
-
-  if (device.radar_uart_ok && (millis() - lastRadarFrameTime > RADAR_TIMEOUT_MS)) {
-    device.radar_uart_ok = false;
-  }
 }
 
-void leggiSensoriI2C() {
-  device.sht40_ok = false;
-  sensors_event_t hum, temp;
-  if (sht4x.getEvent(&hum, &temp)) {
-    if (!isnan(temp.temperature) && temp.temperature > -40.0 && temp.temperature < 85.0 &&
-        !isnan(hum.relative_humidity) && hum.relative_humidity >= 0.0 && hum.relative_humidity <= 100.0) {
-      
-      // Applicazione offset di calibrazione canonici
-      device.temp_c = temp.temperature + calib.temp_offset;
-      
-      float comp_h = hum.relative_humidity + calib.hum_offset;
-      if (comp_h < 0.0) comp_h = 0.0;
-      if (comp_h > 100.0) comp_h = 100.0;
-      device.hum_pct = comp_h;
-      
-      device.sht40_ok = true;
+// ============================================================
+// Gestione Pressione Pulsante BOOT (Factory Reset Zigbee)
+// ============================================================
+void gestisciPulsante(unsigned long now) {
+  const bool buttonLow = (digitalRead(BUTTON_BOOT_PIN) == LOW);
+
+  if (buttonLow && !buttonWasLow) {
+    buttonPressTime       = now;
+    buttonLastChangeTime  = now;
+    buttonWasLow          = true;
+    factoryResetTriggered = false;
+  }
+
+  if (!buttonLow && buttonWasLow) {
+    buttonWasLow          = false;
+    factoryResetTriggered = false;
+  }
+
+  if (buttonLow && buttonWasLow && !factoryResetTriggered &&
+      (now - buttonLastChangeTime >= BUTTON_DEBOUNCE_MS) &&
+      (now - buttonPressTime >= FACTORY_RESET_HOLD_MS)) {
+
+    factoryResetTriggered = true;
+
+    Serial.println("\n[RESET] Factory reset Zigbee richiesto...");
+    Serial.println("[RESET] Azzeramento credenziali Flash NVS...");
+
+    Zigbee.factoryReset(true);
+
+    while (true) {
+      delay(1000);
     }
-  } else {
-    sht4x.begin(&Wire);
-  }
-
-  float l = lightMeter.readLightLevel();
-  if (l >= 0.0 && l <= 65535.0) {
-    // Applicazione moltiplicatore lux
-    device.lux = l * calib.lux_factor;
-    device.bh1750_ok = true;
-  } else {
-    device.bh1750_ok = false;
-    lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE, 0x23, &Wire);
   }
 }
 
-// --- LAYER 3: CONFIGURAZIONE & PORTALE ---
-void avviaCaptivePortal(bool forzaApertura) {
-  WiFiManager wifiManager;
-  wifiManager.setSaveConfigCallback(saveConfigCallback);
-
-  WiFiManagerParameter custom_mqtt_server("server", "IP Broker MQTT (es. 192.168.1.174)", mqtt_server, 40);
-  WiFiManagerParameter custom_mqtt_port("port", "Porta MQTT (default 1883)", mqtt_port, 6);
-  WiFiManagerParameter custom_mqtt_user("user", "Utente MQTT (opzionale)", mqtt_user, 40);
-  WiFiManagerParameter custom_mqtt_pass("pass", "Password MQTT (opzionale)", mqtt_pass, 40);
-
-  wifiManager.addParameter(&custom_mqtt_server);
-  wifiManager.addParameter(&custom_mqtt_port);
-  wifiManager.addParameter(&custom_mqtt_user);
-  wifiManager.addParameter(&custom_mqtt_pass);
-
-  String customCss = "<style>"
-                     "div[style*='text-align:center;'] { display: none !important; }"
-                     "button { background-color: #27AE60 !important; color: white !important; border-radius: 8px !important; }"
-                     "</style>";
-  wifiManager.setCustomHeadElement(customCss.c_str());
-  wifiManager.setTitle("SmartSense Setup");
-  wifiManager.setDarkMode(true);
-  wifiManager.setConfigPortalTimeout(180);
-
-  bool connesso = forzaApertura ? wifiManager.startConfigPortal("SmartSense-Setup") 
-                                : wifiManager.autoConnect("SmartSense-Setup");
-
-  if (!connesso) {
-    delay(2000);
-    ESP.restart();
-  }
-
-  if (shouldSaveConfig) {
-    String new_server = custom_mqtt_server.getValue();
-    String new_port   = custom_mqtt_port.getValue();
-    new_server.trim();
-    new_port.trim();
-    int port_num = new_port.toInt();
-
-    if (new_server.length() > 0 && port_num > 0 && port_num <= 65535) {
-      strlcpy(mqtt_server, new_server.c_str(), sizeof(mqtt_server));
-      strlcpy(mqtt_port,   new_port.c_str(),   sizeof(mqtt_port));
-      strlcpy(mqtt_user,   custom_mqtt_user.getValue(), sizeof(mqtt_user));
-      strlcpy(mqtt_pass,   custom_mqtt_pass.getValue(), sizeof(mqtt_pass));
-
-      prefs.begin("smartsense", false);
-      prefs.putString("server", mqtt_server);
-      prefs.putString("port",   mqtt_port);
-      prefs.putString("user",   mqtt_user);
-      prefs.putString("pass",   mqtt_pass);
-      prefs.end();
-      Serial.println("[CONFIG] Parametri salvati in memoria!");
-    }
-    shouldSaveConfig = false;
-  }
-}
-
-// --- LAYER 4: TRANSPORT MQTT ---
-void tentativoConnessioneMqtt() {
-  if (strlen(mqtt_server) == 0) return;
-
-  String clientId = "SmartSense-Living-";
-  clientId += String((uint32_t)ESP.getEfuseMac(), HEX);
-
-  bool connected = false;
-  if (strlen(mqtt_user) > 0) {
-    connected = mqttClient.connect(clientId.c_str(), mqtt_user, mqtt_pass, mqtt_topic_status, 1, true, "offline");
-  } else {
-    connected = mqttClient.connect(clientId.c_str(), mqtt_topic_status, 1, true, "offline");
-  }
-
-  if (connected) {
-    Serial.println("[MQTT] Connesso con successo!");
-    mqttClient.publish(mqtt_topic_status, "online", true);
-    
-    // Sottoscrizione al canale di calibrazione comandi
-    mqttClient.subscribe(mqtt_topic_set);
-    Serial.printf("[MQTT] Iscritto a %s\n", mqtt_topic_set);
-    
-    // Pubblicazione dello stato dei parametri correnti
-    pubblicaStatoCalibrazione();
-  }
-}
-
-void pubblicaDatiMQTT() {
-  char tempStr[10], humStr[10], luxStr[10];
-  char distStr[10], movDistStr[10], statDistStr[10], movEnStr[6], statEnStr[6];
-
-  if (device.sht40_ok) {
-    snprintf(tempStr, sizeof(tempStr), "%.2f", device.temp_c);
-    snprintf(humStr,  sizeof(humStr),  "%.2f", device.hum_pct);
-  } else {
-    strcpy(tempStr, "null");
-    strcpy(humStr, "null");
-  }
-
-  if (device.bh1750_ok) {
-    snprintf(luxStr, sizeof(luxStr), "%.2f", device.lux);
-  } else {
-    strcpy(luxStr, "null");
-  }
-
-  if (device.radar_uart_ok) {
-    snprintf(distStr,     sizeof(distStr),     "%u", device.dist_cm);
-    snprintf(movDistStr,  sizeof(movDistStr),  "%u", device.moving_dist_cm);
-    snprintf(statDistStr, sizeof(statDistStr), "%u", device.stat_dist_cm);
-    snprintf(movEnStr,    sizeof(movEnStr),    "%u", device.moving_energy);
-    snprintf(statEnStr,   sizeof(statEnStr),   "%u", device.stat_energy);
-  } else {
-    strcpy(distStr,     "null");
-    strcpy(movDistStr,  "null");
-    strcpy(statDistStr, "null");
-    strcpy(movEnStr,    "null");
-    strcpy(statEnStr,   "null");
-  }
-
-  char payload[512];
-  snprintf(payload, sizeof(payload), 
-           "{\"presence\":%s,\"radar_state\":\"%s\",\"distance_cm\":%s,"
-           "\"moving_dist_cm\":%s,\"moving_energy\":%s,\"stat_dist_cm\":%s,\"stat_energy\":%s,"
-           "\"temperature\":%s,\"humidity\":%s,\"lux\":%s,\"rssi\":%ld,"
-           "\"diag\":{\"heap_free\":%u,\"heap_min\":%u,\"uptime_s\":%lu,\"boot\":\"%s\"},"
-           "\"sensors\":{\"sht40\":\"%s\",\"bh1750\":\"%s\",\"ld2410c\":\"%s\"}}",
-           device.presence_filtered ? "true" : "false",
-           device.radar_uart_ok ? decodificaStatoRadar(device.target_state) : "fallback_gpio",
-           distStr, movDistStr, movEnStr, statDistStr, statEnStr,
-           tempStr, humStr, luxStr, (long)device.rssi,
-           device.free_heap, device.min_free_heap, (unsigned long)device.uptime_sec, bootReasonStr,
-           device.sht40_ok ? "ok" : "error",
-           device.bh1750_ok ? "ok" : "error",
-           device.radar_uart_ok ? "ok" : "error");
-
-  if (mqttClient.connected()) {
-    mqttClient.publish(mqtt_topic_env, payload);
-    Serial.print("[MQTT PUB] ");
-    Serial.println(payload);
-  }
-}
-
-// --- SETUP ---
+// ============================================================
+// Setup
+// ============================================================
 void setup() {
   Serial.begin(115200);
-  while (!Serial && millis() < 3000) { delay(10); }
 
-  bootReasonStr = ottieniMotivoReset();
+  const unsigned long serialStart = millis();
+  while (!Serial && millis() - serialStart < 3000UL) {
+    delay(10);
+  }
 
   Serial.println("\n=======================================================");
-  Serial.println("   SmartSense Lab - Nodo Salotto | Firmware v0.4");
-  Serial.printf("   Motivo Avvio: %s\n", bootReasonStr);
+  Serial.println(" SmartSense Lab - Zigbee Multisensore v0.3.1");
+  Serial.println(" XIAO ESP32-C6 | SHT40 | BH1750 | LD2410C");
+  Serial.println(" Ruolo: Zigbee Router (IEEE 802.15.4)");
   Serial.println("=======================================================");
 
   pinMode(RADAR_OUT_PIN, INPUT);
   pinMode(BUTTON_BOOT_PIN, INPUT_PULLUP);
 
-  RadarSerial.begin(256000, SERIAL_8N1, RADAR_RX_PIN, RADAR_TX_PIN);
+  occupancyState = (digitalRead(RADAR_OUT_PIN) == HIGH);
 
+  // 1. Inizializzazione Bus I2C
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
-  sht4x.begin(&Wire);
-  sht4x.setPrecision(SHT4X_HIGH_PRECISION);
-  sht4x.setHeater(SHT4X_NO_HEATER);
-  lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE, 0x23, &Wire);
 
-  // Caricamento credenziali e parametri di calibrazione da Flash NVS
-  prefs.begin("smartsense", true);
-  strlcpy(mqtt_server, prefs.getString("server", "").c_str(), sizeof(mqtt_server));
-  strlcpy(mqtt_port,   prefs.getString("port", "1883").c_str(), sizeof(mqtt_port));
-  strlcpy(mqtt_user,   prefs.getString("user", "").c_str(), sizeof(mqtt_user));
-  strlcpy(mqtt_pass,   prefs.getString("pass", "").c_str(), sizeof(mqtt_pass));
-
-  calib.temp_offset  = prefs.getFloat("t_off", 0.0);
-  calib.hum_offset   = prefs.getFloat("h_off", 0.0);
-  calib.lux_factor   = prefs.getFloat("l_fac", 1.0);
-  calib.off_delay_ms = prefs.getUInt("r_del", 2500);
-  prefs.end();
-
-  bool mancaMqtt = (strlen(mqtt_server) == 0);
-  avviaCaptivePortal(mancaMqtt);
-
-  mqttClient.setServer(mqtt_server, atoi(mqtt_port));
-  mqttClient.setCallback(mqttCallback);
-  mqttClient.setBufferSize(576);
-
-  // --- CONFIGURAZIONE WATCHDOG TIMER (WDT) ---
-  esp_task_wdt_config_t wdt_config = {
-    .timeout_ms = WDT_TIMEOUT_SEC * 1000,
-    .idle_core_mask = (1 << 0),
-    .trigger_panic = true
-  };
-  
-  esp_err_t err = esp_task_wdt_init(&wdt_config);
-  if (err == ESP_ERR_INVALID_STATE) {
-    esp_task_wdt_reconfigure(&wdt_config);
+  // 2. SHT40
+  sht40Ok = sht4x.begin(&Wire);
+  if (sht40Ok) {
+    sht4x.setPrecision(SHT4X_HIGH_PRECISION);
+    sht4x.setHeater(SHT4X_NO_HEATER);
   }
-  esp_task_wdt_add(NULL);
-  Serial.printf("[WDT] Task Watchdog attivo (%d secondi timeout)\n", WDT_TIMEOUT_SEC);
+
+  // 3. BH1750
+  bh1750Ok = lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE, 0x23, &Wire);
+
+  Serial.printf("[SENSORI] SHT40: %s | BH1750: %s\n", 
+                sht40Ok ? "OK" : "ERRORE", 
+                bh1750Ok ? "OK" : "ERRORE");
+
+  // 4. Configurazione Endpoint ZCL
+  zbEnvironment.addHumiditySensor(0.0f, 100.0f, 0.1f);
+  zbIlluminance.setMinMaxValue(0, 0xFFFE);
+
+  zbOccupancy.setManufacturerAndModel("SmartSense", "MultiSensor-ZR");
+  zbEnvironment.setManufacturerAndModel("SmartSense", "MultiSensor-ZR");
+  zbIlluminance.setManufacturerAndModel("SmartSense", "MultiSensor-ZR");
+
+  zbOccupancy.setOccupancy(occupancyState);
+
+  // 5. Registrazione Endpoint
+  if (!Zigbee.addEndpoint(&zbOccupancy)) {
+    Serial.println("[ERRORE] Registrazione endpoint presenza fallita");
+    delay(2000);
+    ESP.restart();
+  }
+
+  if (!Zigbee.addEndpoint(&zbEnvironment)) {
+    Serial.println("[ERRORE] Registrazione endpoint ambientale fallita");
+    delay(2000);
+    ESP.restart();
+  }
+
+  if (!Zigbee.addEndpoint(&zbIlluminance)) {
+    Serial.println("[ERRORE] Registrazione endpoint illuminamento fallita");
+    delay(2000);
+    ESP.restart();
+  }
+
+  // 6. Avvio Stack Router
+  Serial.println("[ZIGBEE] Avvio stack radio in modalita' Router...");
+  if (!Zigbee.begin(ZIGBEE_ROUTER)) {
+    Serial.println("[ERRORE] Avvio stack Zigbee fallito! Riavvio...");
+    delay(2000);
+    ESP.restart();
+  }
+
+  Serial.println("[ZIGBEE] Stack operativo. In ascolto sulla mesh...");
+  lastSensorReportTime = millis();
 }
 
-// --- LOOP PRINCIPALE ---
+// ============================================================
+// Loop
+// ============================================================
 void loop() {
-  esp_task_wdt_reset();
+  const unsigned long now = millis();
 
-  unsigned long now = millis();
+  // 1. Controllo pulsante BOOT
+  gestisciPulsante(now);
 
-  aggiornaRadarUART();
+  // 2. Monitoraggio Connessione Mesh
+  const bool isConnected = Zigbee.connected();
+  if (isConnected != lastConnectedState) {
+    lastConnectedState = isConnected;
 
-  if (digitalRead(BUTTON_BOOT_PIN) == LOW) {
-    if (!isButtonPressed) {
-      isButtonPressed = true;
-      buttonPressStartTime = now;
-    } else if (now - buttonPressStartTime >= PORTAL_TRIGGER_TIME) {
-      Serial.println("\n[PORTAL] Richiesta apertura portale da pulsante...");
-      avviaCaptivePortal(true);
-      mqttClient.setServer(mqtt_server, atoi(mqtt_port));
-      mqttClient.disconnect();
-      isButtonPressed = false;
-    }
-  } else {
-    isButtonPressed = false;
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    if (!mqttClient.connected()) {
-      if (now - lastMqttReconnectTime >= MQTT_RECONNECT_INTERVAL) {
-        lastMqttReconnectTime = now;
-        tentativoConnessioneMqtt();
-      }
+    if (isConnected) {
+      Serial.println("\n>>> [ZIGBEE] CONNESSO ALLA RETE MESH <<<");
+      aggiornaPresenza(true);
+      inviaMisureSensori();
+      lastSensorReportTime = millis();
     } else {
-      mqttClient.loop();
+      Serial.println("[ZIGBEE] Disconnesso o in ricerca di sincronizzazione mesh");
     }
   }
 
-  if (device.radar_uart_ok) {
-    device.presence_raw = (device.target_state > 0);
-  } else {
-    device.presence_raw = digitalRead(RADAR_OUT_PIN);
-  }
+  // 3. Monitoraggio rapido presenza radar
+  aggiornaPresenza(false);
 
-  if (device.presence_raw) {
-    lastRadarDetectionTime = now;
-    device.presence_filtered = true;
-  } else {
-    if (now - lastRadarDetectionTime >= calib.off_delay_ms) {
-      device.presence_filtered = false;
+  // 4. Invio periodico misure ambientali
+  if (now - lastSensorReportTime >= SENSOR_REPORT_INTERVAL_MS) {
+    lastSensorReportTime = now;
+
+    if (isConnected) {
+      inviaMisureSensori();
+    } else {
+      // Diagnostica offline
+      if (sht40Ok) {
+        sensors_event_t h, t;
+        if (sht4x.getEvent(&h, &t)) {
+          Serial.printf("[OFFLINE] Temp: %.2f °C | Hum: %.2f %%\n", t.temperature, h.relative_humidity);
+        }
+      }
+      if (bh1750Ok) {
+        Serial.printf("[OFFLINE] Luce: %.2f lx\n", lightMeter.readLightLevel());
+      }
     }
   }
 
-  bool cambioStatoPresenza = (device.presence_filtered != ultimaPresenzaTrasmessa);
-
-  if (cambioStatoPresenza || (now - lastTelemetryTime >= TELEMETRY_INTERVAL)) {
-    lastTelemetryTime = now;
-    ultimaPresenzaTrasmessa = device.presence_filtered;
-
-    leggiSensoriI2C();
-    device.rssi          = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : 0;
-    device.free_heap     = esp_get_free_heap_size();
-    device.min_free_heap = esp_get_minimum_free_heap_size();
-    device.uptime_sec    = now / 1000;
-
-    pubblicaDatiMQTT();
-  }
+  delay(20);
 }
