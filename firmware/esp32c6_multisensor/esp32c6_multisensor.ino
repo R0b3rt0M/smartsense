@@ -6,24 +6,30 @@
 #include <BH1750.h>
 
 // ============================================================
-// SmartSense Lab - Zigbee Multisensore v0.4.1 (UART Radar)
+// SmartSense Lab - Zigbee Multisensore v0.4.1 (UART Radar + OTA)
 // Hardware: Seeed XIAO ESP32-C6
 // Sensori: SHT40 + BH1750 + HLK-LD2410C (OUT + UART)
 // Ruolo Zigbee: Router (IEEE 802.15.4)
 // ============================================================
 
+// -------------------- Identità ZCL & Parametri OTA -------------------
+constexpr uint16_t SMARTSENSE_MANUFACTURER_CODE = 0x1234;     // ID Vendor SmartSense Lab
+constexpr uint16_t SMARTSENSE_IMAGE_TYPE        = 0x0001;     // Modello MultiSensor-ZR
+constexpr uint32_t SMARTSENSE_CURRENT_VERSION   = 0x00000001; // Versione Firmware: 1 (v0.4.1)
+constexpr uint16_t SMARTSENSE_HW_VERSION        = 1;
+
 // -------------------- Pin Hardware XIAO ESP32-C6 --------------------
-constexpr uint8_t I2C_SDA_PIN     = 22; // D4
-constexpr uint8_t I2C_SCL_PIN     = 23; // D5
-constexpr uint8_t RADAR_OUT_PIN   = 3;  // D1 (Trigger Rapido)
-constexpr uint8_t RADAR_TX_PIN    = 16; // D6 (XIAO TX -> LD2410C RX)
-constexpr uint8_t RADAR_RX_PIN    = 17; // D7 (XIAO RX <- LD2410C TX)
-constexpr uint8_t BUTTON_BOOT_PIN = 9;  // Pulsante 'B' integrato (Attivo LOW)
+constexpr uint8_t I2C_SDA_PIN     = 22; // D4[cite: 1, 2]
+constexpr uint8_t I2C_SCL_PIN     = 23; // D5[cite: 1, 2]
+constexpr uint8_t RADAR_OUT_PIN   = 3;  // D1 (Trigger Rapido)[cite: 2]
+constexpr uint8_t RADAR_TX_PIN    = 16; // D6 (XIAO TX -> LD2410C RX)[cite: 2]
+constexpr uint8_t RADAR_RX_PIN    = 17; // D7 (XIAO RX <- LD2410C TX)[cite: 2]
+constexpr uint8_t BUTTON_BOOT_PIN = 9;  // Pulsante 'B' integrato (Attivo LOW)[cite: 3]
 
 // -------------------- Endpoint Zigbee Canonici ----------------------
-constexpr uint8_t ZIGBEE_EP_OCCUPANCY   = 10; // Presenza binaria (0x0406)
+constexpr uint8_t ZIGBEE_EP_OCCUPANCY   = 10; // Presenza binaria (0x0406) + OTA Client (0x0019)
 constexpr uint8_t ZIGBEE_EP_ENVIRONMENT = 11; // Temp (0x0402) + Umidità (0x0405)
-constexpr uint8_t ZIGBEE_EP_ILLUMINANCE  = 12; // Luce ZCL (0x0400)
+constexpr uint8_t ZIGBEE_EP_ILLUMINANCE = 12; // Luce ZCL (0x0400)
 constexpr uint8_t ZIGBEE_EP_DISTANCE    = 14; // Distanza Radar cm (Analog 0x000C)
 
 // -------------------- Temporizzazioni e Debounce ---------------------
@@ -62,15 +68,15 @@ uint8_t rxIdx = 0;
 unsigned long lastRadarFrameTime = 0;
 
 // -------------------- Stato Runtime ---------------------------------
-bool occupancyState        = false;
-bool lastConnectedState    = false;
+bool occupancyState         = false;
+bool lastConnectedState     = false;
 
 unsigned long lastSensorReportTime = 0;
-unsigned long buttonPressTime      = 0;
-unsigned long buttonLastChangeTime = 0;
+unsigned long buttonPressTime       = 0;
+unsigned long buttonLastChangeTime  = 0;
 
-bool buttonWasLow          = false;
-bool factoryResetTriggered = false;
+bool buttonWasLow           = false;
+bool factoryResetTriggered  = false;
 
 // Conversione ZCL Lux logaritmica (Cluster 0x0400)
 uint16_t luxToZclMeasuredValue(float lux) {
@@ -178,7 +184,6 @@ void inviaMisureSensori() {
   }
 
   // 3. Radar mmWave UART Distanza (Analog Input Cluster 0x000C)
-  // ZigbeeAnalog usa setAnalogInput() e reportAnalogInput().
   if (radar.uart_ok) {
     const float distanceCm = (float)radar.dist_cm;
 
@@ -258,7 +263,7 @@ void setup() {
   while (!Serial && millis() - serialStart < 3000UL) { delay(10); }
 
   Serial.println("\n=======================================================");
-  Serial.println(" SmartSense Lab - Zigbee Multisensore v0.4.1 (UART Radar)");
+  Serial.println(" SmartSense Lab - Zigbee Multisensore v0.4.1 (UART Radar + OTA)");
   Serial.println(" XIAO ESP32-C6 | SHT40 | BH1750 | LD2410C (UART+OUT)");
   Serial.println("=======================================================");
 
@@ -283,20 +288,28 @@ void setup() {
   zbEnvironment.addHumiditySensor(0.0f, 100.0f, 0.1f);
   zbIlluminance.setMinMaxValue(0, 0xFFFE);
 
-  // ZigbeeAnalog non crea automaticamente il cluster Analog Input:
-  // va aggiunto esplicitamente prima di registrare l'endpoint.
+  // Configurazione cluster Analog Input (Endpoint 14)
   zbDistance.addAnalogInput();
   zbDistance.setAnalogInputDescription("LD2410C distance (cm)");
   zbDistance.setAnalogInputResolution(1.0f);
   zbDistance.setAnalogInputMinMax(0.0f, 600.0f);
 
   // Impostazione Identità ZCL
-  zbOccupancy.setManufacturerAndModel("SmartSense", "MultiSensor-ZR");
-  zbEnvironment.setManufacturerAndModel("SmartSense", "MultiSensor-ZR");
-  zbIlluminance.setManufacturerAndModel("SmartSense", "MultiSensor-ZR");
-  zbDistance.setManufacturerAndModel("SmartSense", "MultiSensor-ZR");
+  zbOccupancy.setManufacturerAndModel("SmartSense Lab", "MultiSensor-ZR");
+  zbEnvironment.setManufacturerAndModel("SmartSense Lab", "MultiSensor-ZR");
+  zbIlluminance.setManufacturerAndModel("SmartSense Lab", "MultiSensor-ZR");
+  zbDistance.setManufacturerAndModel("SmartSense Lab", "MultiSensor-ZR");
 
-  // Registrazione Endpoint
+  // Abilitazione nativa Cluster OTA Client tramite le API ZigbeeEP di Arduino ESP32
+  zbOccupancy.addOTAClient(
+      SMARTSENSE_CURRENT_VERSION,    // file_version attuale
+      SMARTSENSE_CURRENT_VERSION,    // downloaded_file_ver
+      SMARTSENSE_HW_VERSION,         // hw_version
+      SMARTSENSE_MANUFACTURER_CODE,  // manufacturer (0x1234)
+      SMARTSENSE_IMAGE_TYPE          // image_type (0x0001)
+  );
+
+  // Registrazione Endpoint su Zigbee Core
   Zigbee.addEndpoint(&zbOccupancy);
   Zigbee.addEndpoint(&zbEnvironment);
   Zigbee.addEndpoint(&zbIlluminance);
@@ -309,7 +322,7 @@ void setup() {
     ESP.restart();
   }
 
-  Serial.println("[ZIGBEE] Stack operativo.");
+  Serial.println("[ZIGBEE] Stack operativo con supporto OTA Client.");
   lastSensorReportTime = millis();
 }
 
