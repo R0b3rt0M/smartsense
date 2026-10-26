@@ -295,10 +295,10 @@ void setup() {
   zbDistance.setAnalogInputMinMax(0.0f, 600.0f);
 
   // Impostazione Identità ZCL
-  zbOccupancy.setManufacturerAndModel("SmartSense Lab", "MultiSensor-ZR");
-  zbEnvironment.setManufacturerAndModel("SmartSense Lab", "MultiSensor-ZR");
-  zbIlluminance.setManufacturerAndModel("SmartSense Lab", "MultiSensor-ZR");
-  zbDistance.setManufacturerAndModel("SmartSense Lab", "MultiSensor-ZR");
+  zbOccupancy.setManufacturerAndModel("SmartSense Lab", "SmartSense Room");
+  zbEnvironment.setManufacturerAndModel("SmartSense Lab", "SmartSense Room");
+  zbIlluminance.setManufacturerAndModel("SmartSense Lab", "SmartSense Room");
+  zbDistance.setManufacturerAndModel("SmartSense Lab", "SmartSense Room");
 
   // Abilitazione nativa Cluster OTA Client tramite le API ZigbeeEP di Arduino ESP32
   zbOccupancy.addOTAClient(
