@@ -4,6 +4,7 @@ import * as ota from 'zigbee-herdsman-converters/lib/ota';
 
 const ea = exposes.access;
 
+// Converter personalizzato per la distanza radar LD2410C (Cluster ZCL genAnalogInput su EP 14)
 const fzLocal = {
     radar_distance: {
         cluster: 'genAnalogInput',
@@ -17,11 +18,12 @@ const fzLocal = {
 };
 
 export default {
-    zigbeeModel: ['MultiSensor-ZR'],
-    model: 'MultiSensor-ZR',
+    // Compatibilità sia con il model ID ZCL della MCU sia con il nome logico del progetto
+    zigbeeModel: ['SmartSense Room'],
+    model: 'SmartSense Room',
     vendor: 'SmartSense Lab',
-    description: 'SmartSense Lab - Multisensore ESP32-C6 Router (LD2410C, SHT40, BH1750)',
-    icon: 'https://raw.githubusercontent.com/R0b3rt0M/smartsense/main/docs/assets/MultiSensor-ZR.png',
+    description: 'SmartSense Room - Multisensore Salotto ESP32-C6 Router (LD2410C, SHT40, BH1750)',
+    icon: 'https://raw.githubusercontent.com/R0b3rt0M/smartsense/main/docs/devices/smartsense_room/assets/MultiSensor-ZR.png',
     extend: [
         m.occupancy(),
         m.temperature({
