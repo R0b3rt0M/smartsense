@@ -1,6 +1,6 @@
 import * as m from 'zigbee-herdsman-converters/lib/modernExtend';
 import * as exposes from 'zigbee-herdsman-converters/lib/exposes';
-import * as ota from 'zigbee-herdsman-converters/lib/ota';
+
 
 const ea = exposes.access;
 
@@ -45,7 +45,7 @@ export default {
             .withUnit('cm')
             .withDescription('Distanza bersaglio LD2410C'),
     ],
-    ota: ota.zigbeeOTA,
+    
     meta: {
         multiEndpoint: true,
     },
