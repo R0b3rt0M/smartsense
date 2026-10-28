@@ -1,48 +1,33 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <math.h>
-#include <Zigbee.h>
+#include <Matter.h>
 #include "Adafruit_SHT4x.h"
 #include <BH1750.h>
 
 // ============================================================
-// SmartSense Lab - Zigbee Multisensore v0.4.1 (UART Radar + OTA)
-// Hardware: Seeed XIAO ESP32-C6
+// SmartSense Lab - SmartSense Room Matter Evaluation (XIAO ESP32-C6)
 // Sensori: SHT40 + BH1750 + HLK-LD2410C (OUT + UART)
-// Ruolo Zigbee: Router (IEEE 802.15.4)
+// Framework: Matter su Arduino ESP32 Core
 // ============================================================
 
-// -------------------- Identità ZCL & Parametri OTA -------------------
-constexpr uint16_t SMARTSENSE_MANUFACTURER_CODE = 0x1234;     // ID Vendor SmartSense Lab
-constexpr uint16_t SMARTSENSE_IMAGE_TYPE        = 0x0001;     // Modello MultiSensor-ZR
-constexpr uint32_t SMARTSENSE_CURRENT_VERSION   = 0x00000001; // Versione Firmware: 1 (v0.4.1)
-constexpr uint16_t SMARTSENSE_HW_VERSION        = 1;
-
 // -------------------- Pin Hardware XIAO ESP32-C6 --------------------
-constexpr uint8_t I2C_SDA_PIN     = 22; // D4[cite: 1, 2]
-constexpr uint8_t I2C_SCL_PIN     = 23; // D5[cite: 1, 2]
-constexpr uint8_t RADAR_OUT_PIN   = 3;  // D1 (Trigger Rapido)[cite: 2]
-constexpr uint8_t RADAR_TX_PIN    = 16; // D6 (XIAO TX -> LD2410C RX)[cite: 2]
-constexpr uint8_t RADAR_RX_PIN    = 17; // D7 (XIAO RX <- LD2410C TX)[cite: 2]
-constexpr uint8_t BUTTON_BOOT_PIN = 9;  // Pulsante 'B' integrato (Attivo LOW)[cite: 3]
+constexpr uint8_t I2C_SDA_PIN     = 22; // D4
+constexpr uint8_t I2C_SCL_PIN     = 23; // D5
+constexpr uint8_t RADAR_OUT_PIN   = 3;  // D1 (Trigger Rapido OUT)
+constexpr uint8_t RADAR_TX_PIN    = 16; // D6 (XIAO TX -> LD2410C RX)
+constexpr uint8_t RADAR_RX_PIN    = 17; // D7 (XIAO RX <- LD2410C TX)
+constexpr uint8_t BUTTON_BOOT_PIN = 9;  // Tasto BOOT a SINISTRA
 
-// -------------------- Endpoint Zigbee Canonici ----------------------
-constexpr uint8_t ZIGBEE_EP_OCCUPANCY   = 10; // Presenza binaria (0x0406) + OTA Client (0x0019)
-constexpr uint8_t ZIGBEE_EP_ENVIRONMENT = 11; // Temp (0x0402) + Umidità (0x0405)
-constexpr uint8_t ZIGBEE_EP_ILLUMINANCE = 12; // Luce ZCL (0x0400)
-constexpr uint8_t ZIGBEE_EP_DISTANCE    = 14; // Distanza Radar cm (Analog 0x000C)
-
-// -------------------- Temporizzazioni e Debounce ---------------------
+// -------------------- Temporizzazioni -------------------------------
 constexpr unsigned long SENSOR_REPORT_INTERVAL_MS = 10000UL;
-constexpr unsigned long FACTORY_RESET_HOLD_MS     = 3000UL;
-constexpr unsigned long BUTTON_DEBOUNCE_MS        = 50UL;
 constexpr unsigned long RADAR_UART_TIMEOUT_MS     = 3000UL;
 
-// -------------------- Istanze Oggetti Zigbee ------------------------
-ZigbeeOccupancySensor   zbOccupancy(ZIGBEE_EP_OCCUPANCY);
-ZigbeeTempSensor        zbEnvironment(ZIGBEE_EP_ENVIRONMENT);
-ZigbeeIlluminanceSensor zbIlluminance(ZIGBEE_EP_ILLUMINANCE);
-ZigbeeAnalog            zbDistance(ZIGBEE_EP_DISTANCE);
+// -------------------- Istanze Endpoint Matter -----------------------
+MatterTemperatureSensor matterTemp;
+MatterHumiditySensor    matterHum;
+MatterLightSensor       matterLight;
+MatterOccupancySensor   matterOccupancy;
 
 // -------------------- Sensori Fisici --------------------------------
 Adafruit_SHT4x sht4x;
@@ -67,26 +52,9 @@ uint8_t rxBuf[64];
 uint8_t rxIdx = 0;
 unsigned long lastRadarFrameTime = 0;
 
-// -------------------- Stato Runtime ---------------------------------
-bool occupancyState         = false;
-bool lastConnectedState     = false;
-
+// Stato Runtime
+bool occupancyState = false;
 unsigned long lastSensorReportTime = 0;
-unsigned long buttonPressTime       = 0;
-unsigned long buttonLastChangeTime  = 0;
-
-bool buttonWasLow           = false;
-bool factoryResetTriggered  = false;
-
-// Conversione ZCL Lux logaritmica (Cluster 0x0400)
-uint16_t luxToZclMeasuredValue(float lux) {
-  if (!isfinite(lux) || lux <= 0.0001f) return 0;
-  if (lux > 100000.0f) lux = 100000.0f;
-  float zcl = 10000.0f * log10f(lux) + 1.0f;
-  if (zcl < 1.0f) zcl = 1.0f;
-  if (zcl > 0xFFFE) zcl = 0xFFFE;
-  return static_cast<uint16_t>(lroundf(zcl));
-}
 
 const char* decodificaStatoRadar(uint8_t st) {
   switch (st) {
@@ -98,9 +66,7 @@ const char* decodificaStatoRadar(uint8_t st) {
   }
 }
 
-// ------------------------------------------------------------
 // Parser UART per frame binario LD2410C
-// ------------------------------------------------------------
 void aggiornaRadarUART() {
   while (RadarSerial.available()) {
     uint8_t b = RadarSerial.read();
@@ -111,7 +77,6 @@ void aggiornaRadarUART() {
       rxIdx = 0;
     }
 
-    // Ricerca Header standard LD2410 (F4 F3 F2 F1)
     if (rxIdx == 1 && rxBuf[0] != 0xF4) rxIdx = 0;
     else if (rxIdx == 2 && rxBuf[1] != 0xF3) rxIdx = 0;
     else if (rxIdx == 3 && rxBuf[2] != 0xF2) rxIdx = 0;
@@ -127,7 +92,6 @@ void aggiornaRadarUART() {
       }
 
       if (rxIdx == totalFrameLen) {
-        // Verifica trailer standard LD2410 (F8 F7 F6 F5)
         if (rxBuf[totalFrameLen - 4] == 0xF8 &&
             rxBuf[totalFrameLen - 3] == 0xF7 &&
             rxBuf[totalFrameLen - 2] == 0xF6 &&
@@ -155,126 +119,63 @@ void aggiornaRadarUART() {
   }
 }
 
-// ------------------------------------------------------------
-// Report periodico sensori (I2C + UART Distanza)
-// ------------------------------------------------------------
-void inviaMisureSensori() {
-  // 1. SHT40
+// Aggiornamento misure e invio agli endpoint Matter
+void aggiornaMisureSensori() {
+  // 1. SHT40 (Temperatura & Umidità)
   if (sht40Ok) {
     sensors_event_t h, t;
     if (sht4x.getEvent(&h, &t)) {
       if (isfinite(t.temperature) && isfinite(h.relative_humidity)) {
-        zbEnvironment.setTemperature(t.temperature);
-        zbEnvironment.setHumidity(h.relative_humidity);
-        zbEnvironment.report();
-        Serial.printf("[ZIGBEE] SHT40 -> Temp: %.2f °C | Hum: %.2f %%\n", t.temperature, h.relative_humidity);
+        matterTemp.setTemperature(t.temperature);
+        matterHum.setHumidity(h.relative_humidity);
+        Serial.printf("[MATTER] SHT40 -> Temp: %.2f °C | Hum: %.2f %%\n", t.temperature, h.relative_humidity);
       }
     }
   }
 
-  // 2. BH1750
+  // 2. BH1750 (Luce)
   if (bh1750Ok) {
     const float lux = lightMeter.readLightLevel();
     if (isfinite(lux) && lux >= 0.0f) {
-      const uint16_t zclValue = luxToZclMeasuredValue(lux);
-      zbIlluminance.setIlluminance(zclValue);
-      zbIlluminance.report();
-      Serial.printf("[ZIGBEE] BH1750 -> Luce: %.2f lx (ZCL: %u)\n", lux, zclValue);
+      matterLight.setIlluminance(lux);
+      Serial.printf("[MATTER] BH1750 -> Luce: %.2f lx\n", lux);
     }
   }
 
-  // 3. Radar mmWave UART Distanza (Analog Input Cluster 0x000C)
+  // 3. Radar LD2410C Distanza (Stampa diagnostica)
   if (radar.uart_ok) {
-    const float distanceCm = (float)radar.dist_cm;
-
-    if (zbDistance.setAnalogInput(distanceCm)) {
-      if (zbDistance.reportAnalogInput()) {
-        Serial.printf("[ZIGBEE] LD2410C UART -> Stato: %s | Dist: %.0f cm "
-                      "(Mov: %u cm, En: %u | Stat: %u cm, En: %u)\n",
-                      decodificaStatoRadar(radar.target_state), distanceCm,
-                      radar.moving_dist, radar.moving_energy,
-                      radar.stat_dist, radar.stat_energy);
-      } else {
-        Serial.println("[ZIGBEE] Avviso: report distanza radar non riuscito.");
-      }
-    } else {
-      Serial.println("[ZIGBEE] Avviso: aggiornamento valore distanza radar non riuscito.");
-    }
+    Serial.printf("[RADAR UART] Stato: %s | Distanza: %u cm\n",
+                  decodificaStatoRadar(radar.target_state), radar.dist_cm);
   }
 }
 
-// ------------------------------------------------------------
-// Gestione Presenza (Trigger rapido da pin OUT)
-// ------------------------------------------------------------
-void aggiornaPresenza(bool forzaReport = false) {
+// Gestione Presenza da pin OUT
+void aggiornaPresenza() {
   const bool nuovaPresenza = (digitalRead(RADAR_OUT_PIN) == HIGH);
-  const bool cambiata      = (nuovaPresenza != occupancyState);
-
-  if (cambiata) {
+  if (nuovaPresenza != occupancyState) {
     occupancyState = nuovaPresenza;
-    Serial.printf("[RADAR] Presenza -> %s\n", occupancyState ? "RILEVATA" : "ASSENTE");
-  }
-
-  if (cambiata || forzaReport) {
-    zbOccupancy.setOccupancy(occupancyState);
-    if (Zigbee.connected()) {
-      zbOccupancy.report();
-      Serial.printf("[ZIGBEE] Report presenza trasmesso: %s\n", occupancyState ? "RILEVATA" : "ASSENTE");
-    }
-  }
-}
-
-// ------------------------------------------------------------
-// Gestione Pulsante BOOT (Factory Reset Zigbee)
-// ------------------------------------------------------------
-void gestisciPulsante(unsigned long now) {
-  const bool buttonLow = (digitalRead(BUTTON_BOOT_PIN) == LOW);
-
-  if (buttonLow && !buttonWasLow) {
-    buttonPressTime       = now;
-    buttonLastChangeTime  = now;
-    buttonWasLow          = true;
-    factoryResetTriggered = false;
-  }
-
-  if (!buttonLow && buttonWasLow) {
-    buttonWasLow          = false;
-    factoryResetTriggered = false;
-  }
-
-  if (buttonLow &&
-      buttonWasLow &&
-      !factoryResetTriggered &&
-      (now - buttonLastChangeTime >= BUTTON_DEBOUNCE_MS) &&
-      (now - buttonPressTime >= FACTORY_RESET_HOLD_MS)) {
-
-    factoryResetTriggered = true;
-    Serial.println("\n[RESET] Factory reset Zigbee richiesto...");
-    Serial.println("[RESET] Azzeramento credenziali Flash NVS...");
-    Zigbee.factoryReset();
-    delay(1000);
-    ESP.restart();
+    matterOccupancy.setOccupancy(occupancyState);
+    Serial.printf("[MATTER] Presenza -> %s\n", occupancyState ? "RILEVATA" : "ASSENTE");
   }
 }
 
 void setup() {
   Serial.begin(115200);
-  const unsigned long serialStart = millis();
-  while (!Serial && millis() - serialStart < 3000UL) { delay(10); }
+  delay(2000);
 
   Serial.println("\n=======================================================");
-  Serial.println(" SmartSense Lab - Zigbee Multisensore v0.4.1 (UART Radar + OTA)");
-  Serial.println(" XIAO ESP32-C6 | SHT40 | BH1750 | LD2410C (UART+OUT)");
+  Serial.println(" SmartSense Room - Matter (XIAO ESP32-C6)");
+  Serial.println(" Sensori: SHT40 | BH1750 | LD2410C (UART+OUT)");
   Serial.println("=======================================================");
 
   pinMode(RADAR_OUT_PIN, INPUT);
   pinMode(BUTTON_BOOT_PIN, INPUT_PULLUP);
 
-  // Inizializzazione UART per radar LD2410C (D6 TX, D7 RX)[cite: 2]
+  // Inizializzazione UART1 per radar LD2410C
   RadarSerial.begin(256000, SERIAL_8N1, RADAR_RX_PIN, RADAR_TX_PIN);
 
   // Inizializzazione I2C
-  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN); // SDA GPIO22, SCL GPIO23[cite: 1, 2]
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
   sht40Ok  = sht4x.begin(&Wire);
   if (sht40Ok) {
     sht4x.setPrecision(SHT4X_HIGH_PRECISION);
@@ -284,45 +185,26 @@ void setup() {
 
   Serial.printf("[SENSORI] SHT40: %s | BH1750: %s\n", sht40Ok ? "OK" : "ERR", bh1750Ok ? "OK" : "ERR");
 
-  // Configurazione Endpoint Zigbee
-  zbEnvironment.addHumiditySensor(0.0f, 100.0f, 0.1f);
-  zbIlluminance.setMinMaxValue(0, 0xFFFE);
+  // Inizializzazione degli endpoint Matter
+  matterTemp.begin(20.0);
+  matterHum.begin(50.0);
+  matterLight.begin(100.0);
+  matterOccupancy.begin(false);
 
-  // Configurazione cluster Analog Input (Endpoint 14)
-  zbDistance.addAnalogInput();
-  zbDistance.setAnalogInputDescription("LD2410C distance (cm)");
-  zbDistance.setAnalogInputResolution(1.0f);
-  zbDistance.setAnalogInputMinMax(0.0f, 600.0f);
+  // Avvio dello stack Matter (avvia BLE + Commissioning)
+  Matter.begin();
 
-  // Impostazione Identità ZCL
-  zbOccupancy.setManufacturerAndModel("SmartSense Lab", "SmartSense Room");
-  zbEnvironment.setManufacturerAndModel("SmartSense Lab", "SmartSense Room");
-  zbIlluminance.setManufacturerAndModel("SmartSense Lab", "SmartSense Room");
-  zbDistance.setManufacturerAndModel("SmartSense Lab", "SmartSense Room");
-
-  // Abilitazione nativa Cluster OTA Client tramite le API ZigbeeEP di Arduino ESP32
-  zbOccupancy.addOTAClient(
-      SMARTSENSE_CURRENT_VERSION,    // file_version attuale
-      SMARTSENSE_CURRENT_VERSION,    // downloaded_file_ver
-      SMARTSENSE_HW_VERSION,         // hw_version
-      SMARTSENSE_MANUFACTURER_CODE,  // manufacturer (0x1234)
-      SMARTSENSE_IMAGE_TYPE          // image_type (0x0001)
-  );
-
-  // Registrazione Endpoint su Zigbee Core
-  Zigbee.addEndpoint(&zbOccupancy);
-  Zigbee.addEndpoint(&zbEnvironment);
-  Zigbee.addEndpoint(&zbIlluminance);
-  Zigbee.addEndpoint(&zbDistance);
-
-  Serial.println("[ZIGBEE] Avvio router...");
-  if (!Zigbee.begin(ZIGBEE_ROUTER)) {
-    Serial.println("[ERRORE] Inizializzazione fallita!");
-    delay(2000);
-    ESP.restart();
+  Serial.println("[MATTER] Stack avviato.");
+  
+  if (!Matter.isDeviceCommissioned()) {
+    Serial.println("\n-------------------------------------------------------");
+    Serial.println(">>> DISPOSITIVO NON ASSOCIATO: PRONTO PER IL PAIRING <<<");
+    Serial.println("Apri l'app Google Home sul telefono -> Aggiungi dispositivo Matter");
+    Serial.println("-------------------------------------------------------\n");
+  } else {
+    Serial.println("\n>>> DISPOSITIVO GIA' ASSOCIATO AL FABRIC MATTER <<<\n");
   }
 
-  Serial.println("[ZIGBEE] Stack operativo con supporto OTA Client.");
   lastSensorReportTime = millis();
 }
 
@@ -332,29 +214,26 @@ void loop() {
   // 1. Parsing continuo dati radar via UART
   aggiornaRadarUART();
 
-  // 2. Controllo Pulsante Reset
-  gestisciPulsante(now);
+  // 2. Controllo rapido presenza pin OUT
+  aggiornaPresenza();
 
-  // 3. Monitoraggio Connessione Mesh
-  const bool isConnected = Zigbee.connected();
-  if (isConnected != lastConnectedState) {
-    lastConnectedState = isConnected;
-    if (isConnected) {
-      Serial.println("\n>>> [ZIGBEE] CONNESSO ALLA RETE MESH <<<");
-      aggiornaPresenza(true);
-      inviaMisureSensori();
-      lastSensorReportTime = millis();
-    }
-  }
-
-  // 4. Trigger immediato presenza da pin OUT
-  aggiornaPresenza(false);
-
-  // 5. Invio periodico misure ambientali e distanza radar
+  // 3. Invio periodico misure ambientali agli endpoint Matter
   if (now - lastSensorReportTime >= SENSOR_REPORT_INTERVAL_MS) {
     lastSensorReportTime = now;
-    if (isConnected) {
-      inviaMisureSensori();
+    aggiornaMisureSensori();
+  }
+
+  // 4. Factory reset Matter tenendo premuto BOOT per 10 secondi
+  if (digitalRead(BUTTON_BOOT_PIN) == LOW) {
+    unsigned long pressStart = millis();
+    while (digitalRead(BUTTON_BOOT_PIN) == LOW) {
+      delay(50);
+      if (millis() - pressStart > 10000UL) {
+        Serial.println("\n[RESET] Decommissioning Matter in corso...");
+        Matter.decommission();
+        delay(1000);
+        ESP.restart();
+      }
     }
   }
 
