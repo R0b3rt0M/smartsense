@@ -35,6 +35,9 @@ public:
   bool begin();
   void update(); // Chiamata continua nel loop principale
 
+  // Lettura congiunta ottimizzata I2C (singola transazione per SHT40)
+  bool getEnvironmental(float &temp_c, float &hum_pct);
+
   // Letture con diagnostica di validita
   bool getTemperature(float &temp_c);
   bool getHumidity(float &hum_pct);

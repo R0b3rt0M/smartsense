@@ -17,7 +17,7 @@ constexpr uint16_t SMARTSENSE_HW_VERSION        = 1;
 // -------------------- Pin Hardware XIAO ESP32-C6 --------------------
 constexpr uint8_t I2C_SDA_PIN     = 22; // D4
 constexpr uint8_t I2C_SCL_PIN     = 23; // D5
-constexpr uint8_t RADAR_OUT_PIN   = 3;  // D1 (Trigger rapido OUT)
+constexpr uint8_t RADAR_OUT_PIN   = 1;  // D1 (GPIO1 su XIAO ESP32-C6 - Trigger rapido OUT)
 constexpr uint8_t RADAR_TX_PIN    = 16; // D6 (XIAO TX -> LD2410C RX)
 constexpr uint8_t RADAR_RX_PIN    = 17; // D7 (XIAO RX <- LD2410C TX)
 constexpr uint8_t BUTTON_BOOT_PIN = 9;  // Tasto BOOT (Attivo LOW)
@@ -43,8 +43,8 @@ ZigbeeAnalog            zbDistance(ZIGBEE_EP_DISTANCE);
 
 bool occupancyState        = false;
 bool lastConnectedState    = false;
-unsigned long lastReportTime      = 0;
-unsigned long buttonPressTime     = 0;
+unsigned long lastReportTime       = 0;
+unsigned long buttonPressTime      = 0;
 unsigned long buttonLastChangeTime = 0;
 bool buttonWasLow          = false;
 bool factoryResetTriggered = false;
@@ -65,14 +65,16 @@ void inviaMisureSensori() {
   float lux  = 0.0f;
   RadarData radar;
 
-  // 1. SHT40
-  if (sensors.getTemperature(temp) && sensors.getHumidity(hum)) {
+  // 1. SHT40 (lettura unificata I2C in singola transazione)
+  if (sensors.getEnvironmental(temp, hum)) {
     zbEnvironment.setTemperature(temp);
     zbEnvironment.setHumidity(hum);
     if (Zigbee.connected()) {
       zbEnvironment.report();
     }
     Serial.printf("[ZIGBEE] SHT40 -> Temp: %.2f °C | Hum: %.2f %%\n", temp, hum);
+  } else {
+    Serial.println("[ZIGBEE] SHT40 lettura non valida o sensore offline");
   }
 
   // 2. BH1750
@@ -83,6 +85,8 @@ void inviaMisureSensori() {
       zbIlluminance.report();
     }
     Serial.printf("[ZIGBEE] BH1750 -> Luce: %.2f lx (ZCL: %u)\n", lux, zclLux);
+  } else {
+    Serial.println("[ZIGBEE] BH1750 lettura non valida");
   }
 
   // 3. Radar mmWave UART Distanza (Cluster 0x000C)

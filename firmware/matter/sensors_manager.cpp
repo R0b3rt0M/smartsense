@@ -88,9 +88,9 @@ void SensorsManager::_parseRadarUART() {
             _cached_radar.stat_energy   = _rxBuf[14];
             _cached_radar.dist_cm       = _rxBuf[15] | (_rxBuf[16] << 8);
 
-            _lastRadarFrameMs            = millis();
-            _cached_radar.uart_ok        = true;
-            _radarHealth.last_read_ok    = true;
+            _lastRadarFrameMs                 = millis();
+            _cached_radar.uart_ok             = true;
+            _radarHealth.last_read_ok         = true;
             _radarHealth.last_valid_timestamp = _lastRadarFrameMs;
           }
         }
@@ -110,17 +110,19 @@ void SensorsManager::update() {
   _cached_occ = (digitalRead(_radar_out_pin) == HIGH);
 }
 
-bool SensorsManager::getTemperature(float &temp_c) {
+bool SensorsManager::getEnvironmental(float &temp_c, float &hum_pct) {
   if (!_sht40Health.is_initialized) return false;
 
   sensors_event_t h, t;
   if (_sht4x.getEvent(&h, &t)) {
-    if (isfinite(t.temperature) && t.temperature > -40.0f && t.temperature < 85.0f) {
+    if (isfinite(t.temperature) && t.temperature > -40.0f && t.temperature < 85.0f &&
+        isfinite(h.relative_humidity) && h.relative_humidity >= 0.0f && h.relative_humidity <= 100.0f) {
       _cached_temp = t.temperature;
       _cached_hum  = h.relative_humidity;
       _sht40Health.last_read_ok = true;
       _sht40Health.last_valid_timestamp = millis();
-      temp_c = _cached_temp;
+      temp_c  = _cached_temp;
+      hum_pct = _cached_hum;
       return true;
     }
   }
@@ -128,22 +130,14 @@ bool SensorsManager::getTemperature(float &temp_c) {
   return false;
 }
 
-bool SensorsManager::getHumidity(float &hum_pct) {
-  if (!_sht40Health.is_initialized) return false;
+bool SensorsManager::getTemperature(float &temp_c) {
+  float dummy_hum = 0.0f;
+  return getEnvironmental(temp_c, dummy_hum);
+}
 
-  sensors_event_t h, t;
-  if (_sht4x.getEvent(&h, &t)) {
-    if (isfinite(h.relative_humidity) && h.relative_humidity >= 0.0f && h.relative_humidity <= 100.0f) {
-      _cached_temp = t.temperature;
-      _cached_hum  = h.relative_humidity;
-      _sht40Health.last_read_ok = true;
-      _sht40Health.last_valid_timestamp = millis();
-      hum_pct = _cached_hum;
-      return true;
-    }
-  }
-  _sht40Health.last_read_ok = false;
-  return false;
+bool SensorsManager::getHumidity(float &hum_pct) {
+  float dummy_temp = 0.0f;
+  return getEnvironmental(dummy_temp, hum_pct);
 }
 
 bool SensorsManager::getIlluminance(float &lux) {
