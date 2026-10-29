@@ -11,7 +11,7 @@
 // -------------------- Pin Hardware XIAO ESP32-C6 --------------------
 constexpr uint8_t I2C_SDA_PIN     = 22; // D4
 constexpr uint8_t I2C_SCL_PIN     = 23; // D5
-constexpr uint8_t RADAR_OUT_PIN   = 3;  // D1 (Trigger rapido OUT)
+constexpr uint8_t RADAR_OUT_PIN   = 1;  // D1 (GPIO1 su XIAO ESP32-C6 - Trigger rapido OUT)
 constexpr uint8_t RADAR_TX_PIN    = 16; // D6 (XIAO TX -> LD2410C RX)
 constexpr uint8_t RADAR_RX_PIN    = 17; // D7 (XIAO RX <- LD2410C TX)
 constexpr uint8_t BUTTON_BOOT_PIN = 9;  // Tasto BOOT a SINISTRA
@@ -36,17 +36,21 @@ void inviaMisureSensori() {
   float lux  = 0.0f;
   RadarData radar;
 
-  // 1. SHT40 (Temperatura & Umidità)
-  if (sensors.getTemperature(temp) && sensors.getHumidity(hum)) {
+  // 1. SHT40 (Temperatura & Umidità - Lettura I2C congiunta)
+  if (sensors.getEnvironmental(temp, hum)) {
     matterTemp.setTemperature(temp);
     matterHum.setHumidity(hum);
     Serial.printf("[MATTER] SHT40 -> Temp: %.2f °C | Hum: %.2f %%\n", temp, hum);
+  } else {
+    Serial.println("[MATTER] SHT40 lettura non valida");
   }
 
   // 2. BH1750 (Luce in lux)
   if (sensors.getIlluminance(lux)) {
     matterLight.setIlluminance(lux);
     Serial.printf("[MATTER] BH1750 -> Luce: %.2f lx\n", lux);
+  } else {
+    Serial.println("[MATTER] BH1750 lettura non valida");
   }
 
   // 3. Radar LD2410C (Diagnostica seriale)
