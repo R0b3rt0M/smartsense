@@ -107,7 +107,11 @@ void SensorsManager::_parseRadarUART() {
 
 void SensorsManager::update() {
   _parseRadarUART();
-  _cached_occ = (digitalRead(_radar_out_pin) == HIGH);
+
+  const bool pinHigh = (digitalRead(_radar_out_pin) == HIGH);
+  const bool uartPresence = (_cached_radar.uart_ok && _cached_radar.target_state > 0);
+
+  _cached_occ = pinHigh || uartPresence;
 }
 
 bool SensorsManager::getEnvironmental(float &temp_c, float &hum_pct) {

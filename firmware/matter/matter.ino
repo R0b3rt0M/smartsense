@@ -27,7 +27,7 @@ MatterHumiditySensor    matterHum;
 MatterLightSensor       matterLight;
 MatterOccupancySensor   matterOccupancy;
 
-bool lastOccupancyState = false;
+bool lastReportedOccupancy = false;
 unsigned long lastReportTime = 0;
 
 void inviaMisureSensori() {
@@ -36,7 +36,7 @@ void inviaMisureSensori() {
   float lux  = 0.0f;
   RadarData radar;
 
-  // 1. SHT40 (Temperatura & Umidità - Lettura I2C congiunta)
+  // 1. SHT40 (Temperatura & Umidità)
   if (sensors.getEnvironmental(temp, hum)) {
     matterTemp.setTemperature(temp);
     matterHum.setHumidity(hum);
@@ -59,16 +59,22 @@ void inviaMisureSensori() {
                   sensors.getRadarStateString(), radar.dist_cm,
                   radar.moving_dist, radar.stat_dist);
   }
+  Serial.printf("[DEBUG PIN] GPIO1 (OUT): %s | Target State: %s\n",
+                digitalRead(RADAR_OUT_PIN) == HIGH ? "HIGH" : "LOW",
+                sensors.getRadarStateString());
 }
 
 void aggiornaPresenza() {
   bool currentOccupancy = false;
   sensors.getOccupancy(currentOccupancy);
 
-  if (currentOccupancy != lastOccupancyState) {
-    lastOccupancyState = currentOccupancy;
-    matterOccupancy.setOccupancy(lastOccupancyState);
-    Serial.printf("[MATTER] Presenza -> %s\n", lastOccupancyState ? "RILEVATA" : "ASSENTE");
+  if (currentOccupancy != lastReportedOccupancy) {
+    lastReportedOccupancy = currentOccupancy;
+    matterOccupancy.setOccupancy(lastReportedOccupancy);
+
+    Serial.printf("[MATTER] Presenza -> %s | GPIO1: %s\n",
+                  lastReportedOccupancy ? "OCCUPATA" : "LIBERA",
+                  currentOccupancy ? "HIGH" : "LOW");
   }
 }
 
@@ -96,6 +102,16 @@ void setup() {
 
   Matter.begin();
   Serial.println("[MATTER] Stack avviato.");
+
+  // Allineamento dello stato iniziale subito dopo l'avvio dello stack
+  sensors.update();
+  bool initialOcc = false;
+  sensors.getOccupancy(initialOcc);
+  lastReportedOccupancy = initialOcc;
+  matterOccupancy.setOccupancy(lastReportedOccupancy);
+  Serial.printf("[MATTER] Stato Presenza Iniziale: %s (GPIO1: %s)\n",
+                lastReportedOccupancy ? "OCCUPATA" : "LIBERA",
+                initialOcc ? "HIGH" : "LOW");
 
   if (!Matter.isDeviceCommissioned()) {
     Serial.println("\n=======================================================");
